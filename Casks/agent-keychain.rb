@@ -1,6 +1,6 @@
 cask "agent-keychain" do
-  version "0.1.1"
-  sha256 "f81f4b6815b7f418fcf3da9852b71e2263def26433229f77067e8092ad34c32d"
+  version "0.1.2"
+  sha256 "e57230eca9ce907c2dc4fba57bdf27cb98c0dff5ce39b63cc88140b429ab5942"
 
   url "https://github.com/Goooooooooody/agent-keychain/archive/refs/tags/v#{version}.tar.gz"
   name "Agent Keychain"
