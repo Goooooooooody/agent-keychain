@@ -1,0 +1,51 @@
+---
+name: agent-keychain
+description: >
+  Request secrets from Agent Keychain without bypassing user approval or audit logging.
+  Trigger: When an agent needs a password, API token, credential, key, or secret stored in akc.
+license: Apache-2.0
+metadata:
+  author: goody
+  version: "1.0"
+---
+
+## When to Use
+
+Use this skill when a task requires a secret that may be stored in Agent Keychain (`akc`).
+
+## Critical Patterns
+
+- NEVER ask the user to paste a secret into chat if `akc` can provide it.
+- NEVER use `akc get` for agent access. That is the direct human CLI path.
+- ALWAYS request secrets with `akc agent-get` or the installed hook wrapper.
+- ALWAYS include a concrete reason with the request.
+- Treat returned secrets as ephemeral: use once, do not store in files, logs, memory notes, commits, or summaries.
+- If the daemon denies access or is not running, tell the user exactly what failed and do not work around the approval flow.
+
+## Commands
+
+Request a secret directly:
+
+```bash
+akc agent-get --name <secret-name> --agent "${AKC_AGENT_NAME:-agent}" --reason "<why this task needs it>"
+```
+
+Using the installed shell hook:
+
+```bash
+source "${CODEX_HOME:-$HOME/.codex}/hooks/agent-keychain-secret-access.sh"
+akc_secret_get <secret-name> "<why this task needs it>"
+```
+
+Using the installed PowerShell hook:
+
+```powershell
+. "$env:USERPROFILE\.codex\hooks\agent-keychain-secret-access.ps1"
+Get-AkcSecret -Name "<secret-name>" -Reason "<why this task needs it>"
+```
+
+## Resources
+
+- Agent install docs: `agents/README.md`
+- Shell hook: `agents/hooks/agent-keychain-secret-access.sh`
+- PowerShell hook: `agents/hooks/agent-keychain-secret-access.ps1`

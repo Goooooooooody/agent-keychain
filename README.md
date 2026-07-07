@@ -14,7 +14,7 @@ The only updates this tool will recieve is the above mentioned connector, and se
 
 - Vaults are encrypted by default.
 - V1 is local-only: no cloud service and no network listener.
-- Agent access goes through a Unix socket daemon.
+- Agent access goes through a local IPC daemon: Unix domain sockets on macOS/Linux and named pipes on Windows.
 - Agents do not receive blanket access. Each request is approved or denied by the user unless auto-approval is explicitly enabled.
 - Requests and approvals are written to the vault audit log.
 
@@ -66,6 +66,30 @@ akc --add 'secret-key-value' --name 'secret-for-thing'
 ```
 
 Prefer `akc add --name ...` instead. Inline secrets can be captured by shell history.
+
+
+## Agent installation
+
+You can ask your agent to install Agent Keychain support from this repository. If you do, the installer will automatically create both:
+
+- an agent skill at `~/.codex/skills/agent-keychain/SKILL.md`
+- an agent hook at `~/.codex/hooks/agent-keychain-secret-access.*`
+
+That hook does **not** bypass security. It wraps `akc agent-get`, so requests still go through daemon approval or explicit auto-approval config, and fetches are still audited with the agent label and reason.
+
+Install manually if preferred:
+
+```sh
+bash agents/install.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+.\agents\install.ps1
+```
+
+See [`agents/README.md`](agents/README.md) for details.
 
 ## Agent access
 
