@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "A local, encrypted, agent-friendly terminal keychain"
 license = "MIT"
+repository = "https://github.com/Goooooooooody/agent-keychain"
+homepage = "https://github.com/Goooooooooody/agent-keychain"
 
 [lib]
 name = "agent_keychain"
