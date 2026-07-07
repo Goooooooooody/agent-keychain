@@ -22,7 +22,14 @@ brew tap Goooooooooody/agent-keychain https://github.com/Goooooooooody/agent-key
 brew install Goooooooooody/agent-keychain/agent-keychain
 ```
 
-The formula builds the tagged source release with Cargo.
+The formula builds the tagged source release with Cargo. Homebrew links `akc` into its prefix automatically.
+
+If your shell cannot find `akc` after installation, add Homebrew to your PATH:
+
+```sh
+echo 'eval "$(brew shellenv)"' >> ~/.zprofile
+eval "$(brew shellenv)"
+```
 
 ## Basic usage
 

@@ -11,6 +11,16 @@ class AgentKeychain < Formula
     system "cargo", "install", *std_cargo_args
   end
 
+  def caveats
+    <<~EOS
+      Homebrew links `akc` into its prefix bin directory automatically.
+
+      If your shell cannot find `akc`, add Homebrew to your PATH:
+        echo 'eval "$(brew shellenv)"' >> ~/.zprofile
+        eval "$(brew shellenv)"
+    EOS
+  end
+
   test do
     assert_match "akc", shell_output("#{bin}/akc --version")
     assert_match "agent request auto-approval: disabled", shell_output("#{bin}/akc config auto-approve status")
