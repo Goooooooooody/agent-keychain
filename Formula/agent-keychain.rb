@@ -1,14 +1,14 @@
 class AgentKeychain < Formula
   desc "Local encrypted keychain for user-approved agent secret access"
   homepage "https://github.com/Goooooooooody/agent-keychain"
-  url "https://github.com/Goooooooooody/agent-keychain/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "9821fccd5f773790acbbd9795d98a38dd5df15475c123225cefb640ba73b590f"
+  url "https://github.com/Goooooooooody/agent-keychain/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "f81f4b6815b7f418fcf3da9852b71e2263def26433229f77067e8092ad34c32d"
   license "MIT"
 
-  depends_on "rust" => :build
-
   def install
-    system "cargo", "install", *std_cargo_args
+    odie "agent-keychain currently ships a prebuilt binary for Apple Silicon macOS only" unless OS.mac? && Hardware::CPU.arm?
+
+    bin.install "dist/aarch64-apple-darwin/akc"
   end
 
   def caveats
@@ -22,7 +22,7 @@ class AgentKeychain < Formula
   end
 
   test do
-    assert_match "akc", shell_output("#{bin}/akc --version")
+    assert_match "akc 0.1.1", shell_output("#{bin}/akc --version")
     assert_match "agent request auto-approval: disabled", shell_output("#{bin}/akc config auto-approve status")
   end
 end
