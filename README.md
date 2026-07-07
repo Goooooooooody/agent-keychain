@@ -12,6 +12,18 @@ Open Source - A Secure way for agents to request secrets.
 - Agents do not receive blanket access. Each request is approved or denied by the user unless auto-approval is explicitly enabled.
 - Requests and approvals are written to the vault audit log.
 
+
+## Homebrew
+
+Install from the project tap:
+
+```sh
+brew tap Goooooooooody/agent-keychain https://github.com/Goooooooooody/agent-keychain.git
+brew install Goooooooooody/agent-keychain/agent-keychain
+```
+
+The formula builds the tagged source release with Cargo.
+
 ## Basic usage
 
 ```sh
