@@ -37,6 +37,18 @@ echo 'eval "$(brew shellenv)"' >> ~/.zprofile
 eval "$(brew shellenv)"
 ```
 
+## Windows
+
+Windows is supported for the CLI, encrypted vault operations, TUI, daemon, and agent request flow. The daemon uses Windows named pipes through the same local IPC abstraction that maps to Unix domain sockets on macOS/Linux.
+
+For now, install from a tagged GitHub release artifact or build from source with Rust:
+
+```powershell
+cargo install --git https://github.com/Goooooooooody/agent-keychain.git --tag v0.1.2
+```
+
+The command remains `akc.exe` on Windows.
+
 ## Basic usage
 
 ```sh

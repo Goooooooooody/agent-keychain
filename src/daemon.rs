@@ -2,6 +2,9 @@ use crate::cli::{prompt_approval, prompt_passphrase};
 use crate::config::ConfigStore;
 use crate::vault::{AgentRequest, AuditAction, VaultStore};
 use anyhow::{Context, Result};
+use interprocess::local_socket::{
+    prelude::*, GenericFilePath, GenericNamespaced, ListenerOptions, Name, Stream,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -38,10 +41,7 @@ pub fn request_secret(
     send_request(socket_path, &request)
 }
 
-#[cfg(unix)]
 pub fn run_daemon(vault_path: PathBuf, socket_path: PathBuf, config_path: PathBuf) -> Result<()> {
-    use std::os::unix::net::UnixListener;
-
     let passphrase = prompt_passphrase()?;
     let store = VaultStore::new(vault_path);
     let config_store = ConfigStore::new(config_path);
@@ -49,17 +49,17 @@ pub fn run_daemon(vault_path: PathBuf, socket_path: PathBuf, config_path: PathBu
         .load(&passphrase)
         .context("unlock vault before starting daemon")?;
 
-    if socket_path.exists() {
-        fs::remove_file(&socket_path)
-            .with_context(|| format!("remove stale socket {}", socket_path.display()))?;
-    }
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("create socket directory {}", parent.display()))?;
+            .with_context(|| format!("create IPC directory {}", parent.display()))?;
     }
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("bind socket {}", socket_path.display()))?;
-    println!("akc daemon listening on {}", socket_path.display());
+
+    let name = ipc_name(socket_path.clone())?;
+    let listener = ListenerOptions::new()
+        .name(name)
+        .create_sync()
+        .with_context(|| format!("bind local IPC endpoint {}", ipc_display(&socket_path)))?;
+    println!("akc daemon listening on {}", ipc_display(&socket_path));
 
     for stream in listener.incoming() {
         match stream {
@@ -68,40 +68,42 @@ pub fn run_daemon(vault_path: PathBuf, socket_path: PathBuf, config_path: PathBu
                     eprintln!("agent request failed: {error:#}");
                 }
             }
-            Err(error) => eprintln!("socket accept failed: {error}"),
+            Err(error) => eprintln!("IPC accept failed: {error}"),
         }
     }
     Ok(())
 }
 
-#[cfg(unix)]
 fn send_request(socket_path: PathBuf, command: &AgentCommand) -> Result<AgentResponse> {
-    use std::os::unix::net::UnixStream;
+    let name = ipc_name(socket_path.clone())?;
+    let stream = Stream::connect(name)
+        .with_context(|| format!("connect to akc daemon at {}", ipc_display(&socket_path)))?;
+    let mut conn = BufReader::new(stream);
+    writeln!(conn.get_mut(), "{}", serde_json::to_string(command)?)?;
+    conn.get_mut().flush()?;
 
-    let mut stream = UnixStream::connect(&socket_path)
-        .with_context(|| format!("connect to akc daemon at {}", socket_path.display()))?;
-    writeln!(stream, "{}", serde_json::to_string(command)?)?;
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
+    conn.read_line(&mut line)?;
     serde_json::from_str(line.trim()).context("parse daemon response")
 }
 
-#[cfg(unix)]
 fn handle_client(
-    mut stream: std::os::unix::net::UnixStream,
+    stream: Stream,
     store: &VaultStore,
     config_store: &ConfigStore,
     passphrase: &str,
 ) -> Result<()> {
+    let mut conn = BufReader::new(stream);
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    conn.read_line(&mut line)?;
     let command: AgentCommand = serde_json::from_str(line.trim()).context("parse agent request")?;
     let response = match command {
         AgentCommand::GetSecret(request) => {
             handle_get_secret(store, config_store, passphrase, request)
         }
     };
-    writeln!(stream, "{}", serde_json::to_string(&response)?)?;
+    writeln!(conn.get_mut(), "{}", serde_json::to_string(&response)?)?;
+    conn.get_mut().flush()?;
     Ok(())
 }
 
@@ -233,22 +235,23 @@ fn access_detail(request: &AgentRequest, auto_approved: bool) -> String {
     }
 }
 
-#[cfg(not(unix))]
-pub fn run_daemon(
-    _vault_path: PathBuf,
-    _socket_path: PathBuf,
-    _config_path: PathBuf,
-) -> Result<()> {
-    Err(anyhow!(
-        "akc daemon requires Unix sockets and is only supported on Unix-like systems in v1"
-    ))
+fn ipc_name(socket_path: PathBuf) -> Result<Name<'static>> {
+    if GenericNamespaced::is_supported() {
+        return Ok("dev.goody.agent-keychain.akc"
+            .to_string()
+            .to_ns_name::<GenericNamespaced>()?
+            .into_owned());
+    }
+
+    Ok(socket_path.to_fs_name::<GenericFilePath>()?.into_owned())
 }
 
-#[cfg(not(unix))]
-fn send_request(_socket_path: PathBuf, _command: &AgentCommand) -> Result<AgentResponse> {
-    Err(anyhow!(
-        "akc agent protocol requires Unix sockets and is only supported on Unix-like systems in v1"
-    ))
+fn ipc_display(socket_path: &std::path::Path) -> String {
+    if GenericNamespaced::is_supported() {
+        "local:dev.goody.agent-keychain.akc".to_string()
+    } else {
+        socket_path.display().to_string()
+    }
 }
 
 #[cfg(test)]
