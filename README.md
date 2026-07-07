@@ -4,6 +4,12 @@ Open Source - A Secure way for agents to request secrets.
 
 `akc` is a local-first, terminal-managed encrypted keychain designed for humans and agents.
 
+V1 is entirely run on your machine - I intend to extend this project to connect to a self-hosted backend but I don't want to bundle that by default as not everybody has the same desire. A future release may contain a small update to add a connection tool but it will be disabled by default.
+
+This project is intended to be long-term software that will not be bloated with features or monetized in any way.
+
+The only updates this tool will recieve is the above mentioned connector, and security updates.
+
 ## Security model
 
 - Vaults are encrypted by default.
