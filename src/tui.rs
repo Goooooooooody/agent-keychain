@@ -1,6 +1,7 @@
 use crate::cli::prompt_passphrase;
-use crate::vault::{Vault, VaultStore};
+use crate::vault::{SecretMetadata, Vault, VaultStore};
 use anyhow::Result;
+use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -14,15 +15,44 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use zeroize::Zeroizing;
+
+struct TerminalCleanupGuard {
+    #[cfg(test)]
+    injected: Option<Box<dyn FnMut()>>,
+}
+
+impl TerminalCleanupGuard {
+    fn new() -> Self {
+        Self {
+            #[cfg(test)]
+            injected: None,
+        }
+    }
+}
+
+impl Drop for TerminalCleanupGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(cleanup) = self.injected.as_mut() {
+            cleanup();
+            return;
+        }
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, Show);
+    }
+}
 
 pub fn run_tui(vault_path: PathBuf) -> Result<()> {
-    let passphrase = prompt_passphrase()?;
+    let passphrase = Zeroizing::new(prompt_passphrase()?);
     let store = VaultStore::new(vault_path);
     let mut vault = store.load(&passphrase)?;
     let mut state = ListState::default();
     select_first_if_needed(&vault, &mut state);
 
     enable_raw_mode()?;
+    let cleanup = TerminalCleanupGuard::new();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -46,9 +76,32 @@ pub fn run_tui(vault_path: PathBuf) -> Result<()> {
             frame.render_widget(header, chunks[0]);
 
             let secret_items: Vec<ListItem> = vault
-                .list_names()
+                .list_records()
                 .iter()
-                .map(|name| ListItem::new(Line::from(name.clone())))
+                .map(|record| {
+                    let flags = [
+                        record.metadata.one_time.then_some("one-time"),
+                        record
+                            .metadata
+                            .expires_at
+                            .is_some_and(|at| at <= chrono::Utc::now())
+                            .then_some("expired"),
+                        record
+                            .metadata
+                            .rotate_after
+                            .is_some_and(|at| at <= chrono::Utc::now())
+                            .then_some("rotation due"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                    let suffix = if flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", flags.join(", "))
+                    };
+                    ListItem::new(Line::from(format!("{}{}", record.name, suffix)))
+                })
                 .collect();
             let secrets = List::new(secret_items)
                 .block(Block::default().borders(Borders::ALL).title("Secrets"))
@@ -90,7 +143,7 @@ pub fn run_tui(vault_path: PathBuf) -> Result<()> {
                         eprintln!("{error:#}");
                         wait_for_enter()?;
                     }
-                    store.save(&vault, &passphrase)?;
+                    store.save(&mut vault, &passphrase)?;
                     resume_terminal(&mut terminal)?;
                     select_first_if_needed(&vault, &mut state);
                 }
@@ -101,7 +154,7 @@ pub fn run_tui(vault_path: PathBuf) -> Result<()> {
                             eprintln!("{error:#}");
                             wait_for_enter()?;
                         }
-                        store.save(&vault, &passphrase)?;
+                        store.save(&mut vault, &passphrase)?;
                         resume_terminal(&mut terminal)?;
                     }
                 }
@@ -110,7 +163,7 @@ pub fn run_tui(vault_path: PathBuf) -> Result<()> {
                         suspend_terminal(&mut terminal)?;
                         if confirm(&format!("Delete secret '{name}'?"))? {
                             vault.remove_secret(&name)?;
-                            store.save(&vault, &passphrase)?;
+                            store.save(&mut vault, &passphrase)?;
                         }
                         resume_terminal(&mut terminal)?;
                         select_first_if_needed(&vault, &mut state);
@@ -121,9 +174,7 @@ pub fn run_tui(vault_path: PathBuf) -> Result<()> {
         }
     };
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    drop(cleanup);
     result
 }
 
@@ -136,7 +187,7 @@ fn select_first_if_needed(vault: &Vault, state: &mut ListState) {
     let names = vault.list_names();
     if names.is_empty() {
         state.select(None);
-    } else if state.selected().map_or(true, |index| index >= names.len()) {
+    } else if state.selected().is_none_or(|index| index >= names.len()) {
         state.select(Some(0));
     }
 }
@@ -166,7 +217,30 @@ fn select_previous(vault: &Vault, state: &mut ListState) {
 fn tui_add_secret(vault: &mut Vault) -> Result<()> {
     let name = prompt_line("Secret name: ")?;
     let value = rpassword::prompt_password("Secret value: ")?;
-    vault.add_secret(name, value)
+    let tags = split_labels(&prompt_line("Tags (comma-separated, optional): ")?);
+    let allowed_clients = split_labels(&prompt_line(
+        "Allowed client labels (comma-separated, optional): ",
+    )?);
+    let one_time = confirm("Consume after first successful read?")?;
+    vault.add_secret_with_metadata(
+        name,
+        value,
+        SecretMetadata {
+            tags,
+            one_time,
+            allowed_clients,
+            ..Default::default()
+        },
+    )
+}
+
+fn split_labels(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn tui_edit_secret(vault: &mut Vault, name: &str) -> Result<()> {
@@ -213,4 +287,25 @@ fn wait_for_enter() -> Result<()> {
     let mut ignored = String::new();
     io::stdin().read_line(&mut ignored)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn terminal_cleanup_runs_when_operation_returns_an_error() {
+        let called = Rc::new(Cell::new(false));
+        let witness = Rc::clone(&called);
+        let result: Result<()> = (|| {
+            let _guard = TerminalCleanupGuard {
+                injected: Some(Box::new(move || witness.set(true))),
+            };
+            anyhow::bail!("injected draw failure")
+        })();
+        assert!(result.is_err());
+        assert!(called.get());
+    }
 }

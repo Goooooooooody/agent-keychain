@@ -24,16 +24,24 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
 directories = "5.0"
+fs2 = "0.4"
 interprocess = "2.4"
+libc = "0.2"
 rand_core = { version = "0.6", features = ["getrandom"] }
 ratatui = "0.29"
 rpassword = "7.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "1.0"
+tempfile = "3.10"
 zeroize = "1.8"
 
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
-tempfile = "3.10"
+criterion = "0.5"
+
+[[bench]]
+name = "vault"
+harness = false

@@ -3,10 +3,34 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+fn default_idle_lock_seconds() -> u64 {
+    15 * 60
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
+    /// Legacy setting retained only so older configuration files still parse.
+    /// Persistent auto-approval is intentionally never effective.
     #[serde(default)]
     pub auto_approve_agent_requests: bool,
+    /// Drop the daemon's decrypted vault and derived key after this much secret-access inactivity.
+    #[serde(default = "default_idle_lock_seconds")]
+    pub idle_lock_seconds: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            auto_approve_agent_requests: false,
+            idle_lock_seconds: default_idle_lock_seconds(),
+        }
+    }
+}
+
+impl Config {
+    pub fn effective_auto_approve(&self) -> bool {
+        false
+    }
 }
 
 pub struct ConfigStore {
@@ -47,6 +71,13 @@ impl ConfigStore {
         self.save(&config)?;
         Ok(config)
     }
+
+    pub fn set_idle_lock_seconds(&self, seconds: u64) -> Result<Config> {
+        let mut config = self.load()?;
+        config.idle_lock_seconds = seconds;
+        self.save(&config)?;
+        Ok(config)
+    }
 }
 
 #[cfg(test)]
@@ -66,5 +97,23 @@ mod tests {
         let store = ConfigStore::new(temp.path().join("config.json"));
         store.set_auto_approve(true).unwrap();
         assert!(store.load().unwrap().auto_approve_agent_requests);
+    }
+
+    #[test]
+    fn legacy_persistent_auto_approve_is_not_effective() {
+        let config = Config {
+            auto_approve_agent_requests: true,
+            ..Config::default()
+        };
+        assert!(!config.effective_auto_approve());
+    }
+
+    #[test]
+    fn idle_lock_has_safe_default_and_can_be_configured() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        assert_eq!(store.load().unwrap().idle_lock_seconds, 900);
+        store.set_idle_lock_seconds(120).unwrap();
+        assert_eq!(store.load().unwrap().idle_lock_seconds, 120);
     }
 }

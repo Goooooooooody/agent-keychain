@@ -1,11 +1,15 @@
 cask "agent-keychain" do
   version "0.1.2"
-  sha256 "e57230eca9ce907c2dc4fba57bdf27cb98c0dff5ce39b63cc88140b429ab5942"
+  # Update this digest from akc-aarch64-apple-darwin.tar.gz.sha256 in the
+  # corresponding GitHub release whenever version changes.
+  sha256 "adcfc32d4927b21706e149f1ca332ad3f5fa0b230299c2de03166631077ff226"
 
-  url "https://github.com/Goooooooooody/agent-keychain/archive/refs/tags/v#{version}.tar.gz"
+  url "https://github.com/Goooooooooody/agent-keychain/releases/download/v#{version}/akc-aarch64-apple-darwin.tar.gz"
   name "Agent Keychain"
   desc "Local encrypted keychain for user-approved agent secret access"
   homepage "https://github.com/Goooooooooody/agent-keychain"
 
-  binary "agent-keychain-#{version}/dist/aarch64-apple-darwin/akc", target: "akc"
+  depends_on arch: :arm64
+
+  binary "akc"
 end
