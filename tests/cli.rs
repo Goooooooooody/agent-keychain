@@ -69,7 +69,7 @@ fn corrupt_vault_returns_safe_error() {
 }
 
 #[test]
-fn cli_config_auto_approve_enable_disable_status() {
+fn noninteractive_auto_approve_enable_is_rejected() {
     let temp = TempDir::new().unwrap();
     let mut cmd = akc(&temp);
     cmd.env("AKC_CONFIG_PATH", temp.path().join("config.json"))
@@ -82,20 +82,53 @@ fn cli_config_auto_approve_enable_disable_status() {
     cmd.env("AKC_CONFIG_PATH", temp.path().join("config.json"))
         .args(["config", "auto-approve", "enable"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("enabled"));
+        .failure()
+        .stderr(predicate::str::contains("interactive terminal"));
 
-    let mut cmd = akc(&temp);
-    cmd.env("AKC_CONFIG_PATH", temp.path().join("config.json"))
-        .args(["config", "auto-approve", "status"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("enabled"));
-
+    // Revocation remains safe and idempotent even if no daemon is running.
     let mut cmd = akc(&temp);
     cmd.env("AKC_CONFIG_PATH", temp.path().join("config.json"))
         .args(["config", "auto-approve", "disable"])
         .assert()
         .success()
         .stdout(predicate::str::contains("disabled"));
+}
+
+#[test]
+fn metadata_is_listed_without_exposing_secret_value() {
+    let temp = TempDir::new().unwrap();
+    akc(&temp).arg("init").assert().success();
+    akc(&temp)
+        .args([
+            "add",
+            "--name",
+            "deploy",
+            "--value",
+            "never-print",
+            "--tags",
+            "prod,api",
+            "--one-time",
+            "--allow-client",
+            "codex",
+        ])
+        .assert()
+        .success();
+    akc(&temp)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deploy"))
+        .stdout(predicate::str::contains("one-time"))
+        .stdout(predicate::str::contains("never-print").not());
+}
+
+#[test]
+fn restore_requires_explicit_verification_flag() {
+    let temp = TempDir::new().unwrap();
+    akc(&temp).arg("init").assert().success();
+    akc(&temp)
+        .args(["restore", "--input", "missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires --verify"));
 }
