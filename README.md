@@ -45,7 +45,7 @@ Windows is supported for the CLI, encrypted vault operations, TUI, daemon, and a
 For now, install from a tagged GitHub release artifact or build from source with Rust:
 
 ```powershell
-cargo install --git https://github.com/Goooooooooody/agent-keychain.git --tag v0.1.2
+cargo install --git https://github.com/Goooooooooody/agent-keychain.git --tag v0.2.0
 ```
 
 The command remains `akc.exe` on Windows.
