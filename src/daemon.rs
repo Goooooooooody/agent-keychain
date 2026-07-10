@@ -11,7 +11,7 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -29,6 +29,8 @@ const WORKER_COUNT: usize = 4;
 const CONNECTION_QUEUE: usize = 16;
 const MAX_GRANT_SECONDS: u64 = 15 * 60;
 const MAX_GRANT_USES: u32 = 100;
+#[cfg(any(windows, test))]
+const IPC_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -252,6 +254,118 @@ impl Drop for ResponseZeroizeGuard<'_> {
     }
 }
 
+/// Applies bounded IPC I/O on every supported transport. Unix domain sockets use
+/// their native socket timeouts. Windows named pipes do not support those timeout
+/// options, so they run nonblocking and retry `WouldBlock` only until the current
+/// operation deadline.
+struct DeadlineStream {
+    inner: Stream,
+    #[cfg(windows)]
+    read_deadline: Instant,
+    #[cfg(windows)]
+    write_deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn new(inner: Stream) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            inner.set_nonblocking(true)?;
+            let deadline = Instant::now() + IPC_TIMEOUT;
+            Ok(Self {
+                inner,
+                read_deadline: deadline,
+                write_deadline: deadline,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            inner.set_recv_timeout(Some(IPC_TIMEOUT))?;
+            inner.set_send_timeout(Some(IPC_TIMEOUT))?;
+            Ok(Self { inner })
+        }
+    }
+
+    #[cfg(windows)]
+    fn reset_read_deadline(&mut self) {
+        self.read_deadline = Instant::now() + IPC_TIMEOUT;
+    }
+
+    #[cfg(not(windows))]
+    fn reset_read_deadline(&mut self) {}
+
+    #[cfg(windows)]
+    fn reset_write_deadline(&mut self) {
+        self.write_deadline = Instant::now() + IPC_TIMEOUT;
+    }
+
+    #[cfg(not(windows))]
+    fn reset_write_deadline(&mut self) {}
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        #[cfg(windows)]
+        {
+            let deadline = self.read_deadline;
+            retry_would_block_until(deadline, || self.inner.read(buffer))
+        }
+        #[cfg(not(windows))]
+        {
+            self.inner.read(buffer)
+        }
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        #[cfg(windows)]
+        {
+            let deadline = self.write_deadline;
+            retry_would_block_until(deadline, || self.inner.write(buffer))
+        }
+        #[cfg(not(windows))]
+        {
+            self.inner.write(buffer)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            let deadline = self.write_deadline;
+            retry_would_block_until(deadline, || self.inner.flush())
+        }
+        #[cfg(not(windows))]
+        {
+            self.inner.flush()
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn retry_would_block_until<T>(
+    deadline: Instant,
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "IPC operation timed out",
+                    ));
+                }
+                thread::sleep(IPC_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
 pub fn request_secrets(
     socket_path: PathBuf,
     agent: String,
@@ -441,14 +555,15 @@ pub fn run_daemon(vault_path: PathBuf, socket_path: PathBuf, config_path: PathBu
                         state.metrics.queue_rejections =
                             state.metrics.queue_rejections.saturating_add(1);
                     }
-                    let _ = stream.set_send_timeout(Some(IPC_TIMEOUT));
-                    let mut conn = BufReader::new(stream);
-                    let _ = write_error_response(
-                        &mut conn,
-                        &new_request_id(),
-                        ErrorCode::Busy,
-                        "daemon request queue is full",
-                    );
+                    if let Ok(stream) = DeadlineStream::new(stream) {
+                        let mut conn = BufReader::new(stream);
+                        let _ = write_error_response(
+                            &mut conn,
+                            &new_request_id(),
+                            ErrorCode::Busy,
+                            "daemon request queue is full",
+                        );
+                    }
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => break,
             },
@@ -475,9 +590,7 @@ fn send_request(socket_path: PathBuf, command: &AgentCommand) -> Result<AgentRes
     let name = ipc_name(socket_path.clone())?;
     let stream = Stream::connect(name)
         .with_context(|| format!("connect to akc daemon at {}", ipc_display(&socket_path)))?;
-    stream.set_recv_timeout(Some(IPC_TIMEOUT))?;
-    stream.set_send_timeout(Some(IPC_TIMEOUT))?;
-    let mut conn = BufReader::new(stream);
+    let mut conn = BufReader::new(DeadlineStream::new(stream)?);
     let request_id = new_request_id();
     writeln!(
         conn.get_mut(),
@@ -488,6 +601,7 @@ fn send_request(socket_path: PathBuf, command: &AgentCommand) -> Result<AgentRes
         })?
     )?;
     conn.get_mut().flush()?;
+    conn.get_mut().reset_read_deadline();
     let line = Zeroizing::new(read_request_frame(&mut conn)?);
     let response: ResponseEnvelope =
         serde_json::from_slice(&line).context("parse daemon response")?;
@@ -506,9 +620,7 @@ fn send_request(socket_path: PathBuf, command: &AgentCommand) -> Result<AgentRes
 fn handle_client(stream: Stream, state: &Arc<Mutex<DaemonState>>) -> Result<()> {
     let started = Instant::now();
     let peer = authorize_peer(&stream)?;
-    stream.set_recv_timeout(Some(IPC_TIMEOUT))?;
-    stream.set_send_timeout(Some(IPC_TIMEOUT))?;
-    let mut conn = BufReader::new(stream);
+    let mut conn = BufReader::new(DeadlineStream::new(stream)?);
     let line = match read_request_frame(&mut conn) {
         Ok(line) => Zeroizing::new(line),
         Err(error) => {
@@ -553,6 +665,7 @@ fn handle_client(stream: Stream, state: &Arc<Mutex<DaemonState>>) -> Result<()> 
         response: guard.0,
     })?);
     drop(guard);
+    conn.get_mut().reset_write_deadline();
     conn.get_mut().write_all(&encoded)?;
     conn.get_mut().write_all(b"\n")?;
     conn.get_mut().flush()?;
@@ -578,7 +691,7 @@ fn is_timeout_error(error: &anyhow::Error) -> bool {
 }
 
 fn write_error_response(
-    conn: &mut BufReader<Stream>,
+    conn: &mut BufReader<DeadlineStream>,
     request_id: &str,
     code: ErrorCode,
     error: impl std::fmt::Display,
@@ -591,6 +704,7 @@ fn write_error_response(
         protocol_version: PROTOCOL_VERSION,
         response: &response,
     })?;
+    conn.get_mut().reset_write_deadline();
     conn.get_mut().write_all(&encoded)?;
     conn.get_mut().write_all(b"\n")?;
     conn.get_mut().flush().map_err(Into::into)
@@ -1350,6 +1464,28 @@ mod tests {
     fn frames_are_bounded() {
         assert!(read_request_frame(Cursor::new(vec![b'a'; MAX_REQUEST_BYTES + 1])).is_err());
         assert!(read_request_frame(Cursor::new(br#"{"type":"status"}"#.to_vec())).is_err());
+    }
+
+    #[test]
+    fn would_block_retries_are_bounded_by_deadline() {
+        let mut attempts = 0;
+        let value = retry_would_block_until(Instant::now() + Duration::from_millis(100), || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            } else {
+                Ok(42)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts, 3);
+
+        let error = retry_would_block_until(Instant::now(), || -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
