@@ -29,6 +29,8 @@ const WORKER_COUNT: usize = 4;
 const CONNECTION_QUEUE: usize = 16;
 const MAX_GRANT_SECONDS: u64 = 15 * 60;
 const MAX_GRANT_USES: u32 = 100;
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const APPROVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(65);
 #[cfg(any(windows, test))]
 const IPC_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
@@ -60,6 +62,81 @@ pub enum AgentCommand {
         passphrase: String,
     },
     Stop,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ApprovalPrompt {
+    pub agent: String,
+    pub secret_names: Vec<String>,
+    pub reason: Option<String>,
+    pub command_context: Option<String>,
+    pub pid: Option<u32>,
+}
+
+impl ApprovalPrompt {
+    fn single(request: &AgentRequest) -> Self {
+        Self {
+            agent: approval_display_safe(&request.agent),
+            secret_names: vec![approval_display_safe(&request.secret_name)],
+            reason: request.reason.as_deref().map(approval_display_safe),
+            command_context: request
+                .command_context
+                .as_deref()
+                .map(approval_display_safe),
+            pid: request.pid,
+        }
+    }
+
+    fn batch(requests: &[AgentRequest]) -> Self {
+        let first = &requests[0];
+        Self {
+            agent: approval_display_safe(&first.agent),
+            secret_names: requests
+                .iter()
+                .map(|request| approval_display_safe(&request.secret_name))
+                .collect(),
+            reason: first.reason.as_deref().map(approval_display_safe),
+            command_context: first.command_context.as_deref().map(approval_display_safe),
+            pid: first.pid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    ApproveOnce,
+    Deny,
+}
+
+pub trait ApprovalProvider: Send + Sync {
+    fn decide(&self, prompt: ApprovalPrompt) -> Result<ApprovalDecision>;
+}
+
+#[derive(Default)]
+pub struct TerminalApprovalProvider;
+
+impl ApprovalProvider for TerminalApprovalProvider {
+    fn decide(&self, prompt: ApprovalPrompt) -> Result<ApprovalDecision> {
+        let secrets = prompt.secret_names.join(", ");
+        let mut message = if prompt.secret_names.len() == 1 {
+            format!("Agent '{}' requests secret '{}'", prompt.agent, secrets)
+        } else {
+            format!(
+                "Agent '{}' requests {} secrets: {}",
+                prompt.agent,
+                prompt.secret_names.len(),
+                secrets
+            )
+        };
+        if let Some(reason) = prompt.reason {
+            message.push_str(&format!(" for: {reason}"));
+        }
+        Ok(if prompt_approval(&message)? {
+            ApprovalDecision::ApproveOnce
+        } else {
+            ApprovalDecision::Deny
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,6 +314,7 @@ struct DaemonState {
     shutdown: bool,
     metrics_enabled: bool,
     metrics: DaemonMetricsSnapshot,
+    approval_provider: Arc<dyn ApprovalProvider>,
 }
 
 struct ResponseZeroizeGuard<'a>(&'a mut AgentResponse);
@@ -301,6 +379,18 @@ impl DeadlineStream {
 
     #[cfg(not(windows))]
     fn reset_write_deadline(&mut self) {}
+
+    fn set_read_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            self.read_deadline = Instant::now() + timeout;
+        }
+        #[cfg(not(windows))]
+        {
+            self.inner.set_recv_timeout(Some(timeout))?;
+        }
+        Ok(())
+    }
 }
 
 impl Read for DeadlineStream {
@@ -461,6 +551,37 @@ pub fn run_daemon(vault_path: PathBuf, socket_path: PathBuf, config_path: PathBu
     let session = store
         .unlock(&passphrase)
         .context("unlock vault before starting daemon")?;
+    run_daemon_inner(
+        store,
+        Some(session),
+        socket_path,
+        config_path,
+        Arc::new(TerminalApprovalProvider),
+    )
+}
+
+pub fn run_daemon_locked_with_approval(
+    vault_path: PathBuf,
+    socket_path: PathBuf,
+    config_path: PathBuf,
+    approval_provider: Arc<dyn ApprovalProvider>,
+) -> Result<()> {
+    run_daemon_inner(
+        VaultStore::new(vault_path),
+        None,
+        socket_path,
+        config_path,
+        approval_provider,
+    )
+}
+
+fn run_daemon_inner(
+    store: VaultStore,
+    session: Option<VaultSession>,
+    socket_path: PathBuf,
+    config_path: PathBuf,
+    approval_provider: Arc<dyn ApprovalProvider>,
+) -> Result<()> {
     let config_store = ConfigStore::new(config_path);
     let config = config_store.load()?;
 
@@ -488,13 +609,14 @@ pub fn run_daemon(vault_path: PathBuf, socket_path: PathBuf, config_path: PathBu
 
     let state = Arc::new(Mutex::new(DaemonState {
         store,
-        session: Some(session),
+        session,
         last_secret_activity: Instant::now(),
         idle_timeout: Duration::from_secs(config.idle_lock_seconds),
         grants: Vec::new(),
         shutdown: false,
         metrics_enabled: std::env::var_os("AKC_METRICS").is_some(),
         metrics: DaemonMetricsSnapshot::default(),
+        approval_provider,
     }));
     let timer_state = Arc::clone(&state);
     thread::Builder::new()
@@ -601,7 +723,14 @@ fn send_request(socket_path: PathBuf, command: &AgentCommand) -> Result<AgentRes
         })?
     )?;
     conn.get_mut().flush()?;
-    conn.get_mut().reset_read_deadline();
+    if matches!(
+        command,
+        AgentCommand::GetSecret(_) | AgentCommand::GetSecrets { .. }
+    ) {
+        conn.get_mut().set_read_timeout(APPROVAL_RESPONSE_TIMEOUT)?;
+    } else {
+        conn.get_mut().reset_read_deadline();
+    }
     let line = Zeroizing::new(read_request_frame(&mut conn)?);
     let response: ResponseEnvelope =
         serde_json::from_slice(&line).context("parse daemon response")?;
@@ -642,6 +771,23 @@ fn handle_client(stream: Stream, state: &Arc<Mutex<DaemonState>>) -> Result<()> 
             return write_error_response(&mut conn, &request_id, ErrorCode::InvalidRequest, error);
         }
     };
+    let approval_provider = {
+        let state = state
+            .lock()
+            .map_err(|_| anyhow!("daemon state lock poisoned"))?;
+        Arc::clone(&state.approval_provider)
+    };
+    let approval_prompt = {
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("daemon state lock poisoned"))?;
+        approval_prompt_for_command(&mut state, &command, peer)
+    };
+    let approval = approval_prompt.map(|prompt| {
+        approval_provider
+            .decide(prompt)
+            .map_err(|error| error.to_string())
+    });
     let lock_started = Instant::now();
     let mut response = {
         let mut state = state
@@ -656,7 +802,7 @@ fn handle_client(stream: Stream, state: &Arc<Mutex<DaemonState>>) -> Result<()> 
                     .unwrap_or(u64::MAX),
             );
         expire_idle_session(&mut state);
-        handle_command(&mut state, command, peer)
+        handle_command(&mut state, command, peer, approval)
     };
     let guard = ResponseZeroizeGuard(&mut response);
     let encoded = Zeroizing::new(serde_json::to_vec(&ResponseEnvelopeRef {
@@ -710,14 +856,63 @@ fn write_error_response(
     conn.get_mut().flush().map_err(Into::into)
 }
 
+fn approval_prompt_for_command(
+    state: &mut DaemonState,
+    command: &AgentCommand,
+    peer: PeerIdentity,
+) -> Option<ApprovalPrompt> {
+    state.session.as_ref()?;
+    prune_grants(state);
+    match command {
+        AgentCommand::GetSecret(request) => {
+            let request = normalize_request(request.clone(), peer.pid).ok()?;
+            (!state
+                .grants
+                .iter()
+                .any(|grant| grant_matches(grant, &request)))
+            .then(|| ApprovalPrompt::single(&request))
+        }
+        AgentCommand::GetSecrets {
+            agent,
+            pid,
+            secret_names,
+            reason,
+            command_context,
+            grant_token,
+        } if !secret_names.is_empty() && secret_names.len() <= 64 => {
+            let requests = secret_names
+                .iter()
+                .map(|secret_name| {
+                    normalize_request(
+                        AgentRequest {
+                            agent: agent.clone(),
+                            pid: *pid,
+                            secret_name: secret_name.clone(),
+                            reason: reason.clone(),
+                            command_context: command_context.clone(),
+                            grant_token: grant_token.clone(),
+                        },
+                        peer.pid,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()
+                .ok()?;
+            (!batch_is_fully_granted(&state.grants, &requests))
+                .then(|| ApprovalPrompt::batch(&requests))
+        }
+        _ => None,
+    }
+}
+
 fn handle_command(
     state: &mut DaemonState,
     command: AgentCommand,
     peer: PeerIdentity,
+    approval: Option<std::result::Result<ApprovalDecision, String>>,
 ) -> AgentResponse {
     match command {
         AgentCommand::GetSecret(request) => match normalize_request(request, peer.pid) {
-            Ok(request) => handle_get_secret(state, request, peer),
+            Ok(request) => handle_get_secret(state, request, peer, approval),
             Err(error) => error_response(ErrorCode::InvalidRequest, error),
         },
         AgentCommand::GetSecrets {
@@ -745,7 +940,7 @@ fn handle_command(
                     Err(error) => return error_response(ErrorCode::InvalidRequest, error),
                 }
             }
-            handle_get_secrets(state, requests, peer)
+            handle_get_secrets(state, requests, peer, approval)
         }
         AgentCommand::EnableGrant {
             mut passphrase,
@@ -828,6 +1023,7 @@ fn handle_get_secrets(
     state: &mut DaemonState,
     requests: Vec<AgentRequest>,
     _peer: PeerIdentity,
+    approval: Option<std::result::Result<ApprovalDecision, String>>,
 ) -> AgentResponse {
     if requests.is_empty() || requests.len() > 64 {
         return error_response(
@@ -843,19 +1039,19 @@ fn handle_get_secrets(
     }
     prune_grants(state);
     let all_granted = batch_is_fully_granted(&state.grants, &requests);
-    let names = requests
-        .iter()
-        .map(|r| r.secret_name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let approved = all_granted
-        || prompt_approval(&format!(
-            "Agent '{}' requests {} secrets: {}",
-            requests[0].agent,
-            requests.len(),
-            names
-        ))
-        .unwrap_or(false);
+    let approved = if all_granted {
+        true
+    } else {
+        matches!(
+            approval.unwrap_or_else(|| {
+                state
+                    .approval_provider
+                    .decide(ApprovalPrompt::batch(&requests))
+                    .map_err(|error| error.to_string())
+            }),
+            Ok(ApprovalDecision::ApproveOnce)
+        )
+    };
     state.last_secret_activity = Instant::now();
     let Some(session) = state.session.as_mut() else {
         return error_response(ErrorCode::Locked, "daemon is locked");
@@ -964,6 +1160,7 @@ fn handle_get_secret(
     state: &mut DaemonState,
     request: AgentRequest,
     _peer: PeerIdentity,
+    approval: Option<std::result::Result<ApprovalDecision, String>>,
 ) -> AgentResponse {
     if state.session.is_none() {
         return AgentResponse::Error {
@@ -975,16 +1172,6 @@ fn handle_get_secret(
         .grants
         .iter()
         .any(|grant| grant_matches(grant, &request));
-    let prompt = format!(
-        "Agent '{}' requests secret '{}'{}",
-        request.agent,
-        request.secret_name,
-        request
-            .reason
-            .as_ref()
-            .map(|reason| format!(" for: {reason}"))
-            .unwrap_or_default()
-    );
     let approved = if auto_approved {
         println!(
             "used scoped grant for agent '{}' and secret '{}'",
@@ -992,9 +1179,15 @@ fn handle_get_secret(
         );
         true
     } else {
-        match prompt_approval(&prompt) {
-            Ok(approved) => approved,
-            Err(error) => return audit_request_error(state, &request, error.to_string()),
+        match approval.unwrap_or_else(|| {
+            state
+                .approval_provider
+                .decide(ApprovalPrompt::single(&request))
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(ApprovalDecision::ApproveOnce) => true,
+            Ok(ApprovalDecision::Deny) => false,
+            Err(error) => return audit_request_error(state, &request, error),
         }
     };
     state.last_secret_activity = Instant::now();
@@ -1327,6 +1520,21 @@ fn terminal_safe(value: &str) -> String {
         })
         .collect()
 }
+
+fn approval_display_safe(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}' => '?',
+            character if character.is_control() => ' ',
+            character => character,
+        })
+        .collect()
+}
 fn authorize_peer(stream: &Stream) -> Result<PeerIdentity> {
     let credentials = stream.peer_creds().context("read IPC peer credentials")?;
     let pid = credentials.pid().and_then(|pid| u32::try_from(pid).ok());
@@ -1412,6 +1620,18 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    struct RecordingApprovalProvider {
+        prompts: Arc<Mutex<Vec<ApprovalPrompt>>>,
+        decision: ApprovalDecision,
+    }
+
+    impl ApprovalProvider for RecordingApprovalProvider {
+        fn decide(&self, prompt: ApprovalPrompt) -> Result<ApprovalDecision> {
+            self.prompts.lock().unwrap().push(prompt);
+            Ok(self.decision)
+        }
+    }
+
     fn round_trip_raw_frame(frame: Vec<u8>) -> serde_json::Value {
         let socket_temp = tempfile::TempDir::new().unwrap();
         let path = socket_temp
@@ -1456,6 +1676,7 @@ mod tests {
                 shutdown: false,
                 metrics_enabled: false,
                 metrics: DaemonMetricsSnapshot::default(),
+                approval_provider: Arc::new(TerminalApprovalProvider),
             },
         )
     }
@@ -1503,7 +1724,7 @@ mod tests {
         let request = AgentRequest {
             agent: "codex\u{1b}[2J\nspoof".into(),
             pid: Some(1),
-            secret_name: "thing".into(),
+            secret_name: "thing\u{202e}txt".into(),
             reason: Some("deploy\r\nallow?".into()),
             command_context: None,
             grant_token: None,
@@ -1511,6 +1732,88 @@ mod tests {
         let normalized = normalize_request(request, Some(456)).unwrap();
         assert_eq!(normalized.agent, "codex?[2J spoof");
         assert_eq!(normalized.pid, Some(456));
+    }
+
+    #[test]
+    fn approval_prompt_carries_only_request_metadata() {
+        let request = AgentRequest {
+            agent: "codex".into(),
+            pid: Some(456),
+            secret_name: "deploy-token".into(),
+            reason: Some("deploy production".into()),
+            command_context: Some("release.sh".into()),
+            grant_token: Some("must-not-leak".into()),
+        };
+
+        let prompt = ApprovalPrompt::single(&request);
+
+        assert_eq!(prompt.agent, "codex");
+        assert_eq!(prompt.secret_names, vec!["deploy-token"]);
+        assert_eq!(prompt.reason.as_deref(), Some("deploy production"));
+        assert_eq!(prompt.command_context.as_deref(), Some("release.sh"));
+        assert_eq!(prompt.pid, Some(456));
+        let serialized = serde_json::to_string(&prompt).unwrap();
+        assert!(!serialized.contains("must-not-leak"));
+    }
+
+    #[test]
+    fn configured_approval_provider_controls_secret_release() {
+        let (_temp, mut state) = state_with_secret();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        state.approval_provider = Arc::new(RecordingApprovalProvider {
+            prompts: Arc::clone(&prompts),
+            decision: ApprovalDecision::Deny,
+        });
+        let peer = PeerIdentity {
+            pid: Some(456),
+            principal: 42,
+        };
+        let request = AgentRequest {
+            agent: "codex".into(),
+            pid: Some(1),
+            secret_name: "thing".into(),
+            reason: Some("deploy".into()),
+            command_context: Some("release.sh".into()),
+            grant_token: None,
+        };
+
+        let response = handle_get_secret(&mut state, request, peer, None);
+
+        assert!(matches!(response, AgentResponse::Denied { .. }));
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].secret_names, vec!["thing"]);
+    }
+
+    #[test]
+    fn preflight_approval_prompt_uses_sanitized_peer_metadata() {
+        let (_temp, mut state) = state_with_secret();
+        let command = AgentCommand::GetSecret(AgentRequest {
+            agent: "codex\nspoof".into(),
+            pid: Some(1),
+            secret_name: "thing\u{202e}txt".into(),
+            reason: Some("deploy\r\nnow".into()),
+            command_context: Some("release.sh".into()),
+            grant_token: Some("must-not-leak".into()),
+        });
+
+        let prompt = approval_prompt_for_command(
+            &mut state,
+            &command,
+            PeerIdentity {
+                pid: Some(456),
+                principal: 42,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prompt.agent, "codex spoof");
+        assert_eq!(prompt.secret_names, vec!["thing?txt"]);
+        assert_eq!(prompt.reason.as_deref(), Some("deploy  now"));
+        assert_eq!(prompt.pid, Some(456));
+        assert!(!serde_json::to_string(&prompt)
+            .unwrap()
+            .contains("must-not-leak"));
     }
     #[test]
     fn scoped_grant_expires_and_honors_use_limit_and_selector() {
@@ -1722,7 +2025,7 @@ mod tests {
             grant_token: Some(token),
         };
         assert!(matches!(
-            handle_get_secret(&mut state, request, peer),
+            handle_get_secret(&mut state, request, peer, None),
             AgentResponse::Error {
                 code: ErrorCode::NotFound,
                 ..

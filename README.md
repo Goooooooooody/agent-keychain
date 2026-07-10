@@ -29,7 +29,9 @@ brew tap Goooooooooody/agent-keychain https://github.com/Goooooooooody/agent-key
 brew install --cask Goooooooooody/agent-keychain/agent-keychain
 ```
 
-The cask installs a prebuilt Apple Silicon macOS binary and does not require Xcode or Cargo. Homebrew links `akc` into its prefix automatically.
+The cask installs a prebuilt Apple Silicon macOS binary and does not require Xcode or Cargo.
+Homebrew links `akc` into its prefix automatically. A release containing the desktop companion
+will also link `akc-tray` after the cask version and checksum are updated for that release.
 
 If your shell cannot find `akc` after installation, add Homebrew to your PATH:
 
@@ -48,7 +50,40 @@ For now, install from a tagged GitHub release artifact or build from source with
 cargo install --git https://github.com/Goooooooooody/agent-keychain.git --tag v0.2.0
 ```
 
-The command remains `akc.exe` on Windows.
+The command remains `akc.exe` on Windows. Releases containing the desktop companion also include
+`akc-tray.exe`.
+
+## Desktop tray approvals
+
+`akc-tray` runs the daemon as a menu-bar app on macOS, a system-tray app on Linux, and a
+notification-area app on Windows. It starts the daemon locked, sends native notifications for
+secret requests, and opens a trusted approval dialog showing the agent label, secret name, reason,
+command context, and OS-reported process ID. Secret values and capability tokens are never shown in
+notifications or dialogs.
+
+Launch it after installing a release archive:
+
+```sh
+akc-tray
+```
+
+The tray menu provides **Start daemon**, **Unlock**, **Lock**, **Stop daemon**, and **Launch at
+login** controls. Approval dialogs default to denial and time out after 60 seconds. Starting the
+tray companion replaces an already-running terminal daemon so the trusted tray process becomes the
+approval provider.
+
+Linux requires a desktop notification service, Zenity or KDialog, GTK 3, XDo, and AppIndicator.
+For Debian or Ubuntu:
+
+```sh
+sudo apt install zenity libgtk-3-0 libxdo3 libayatana-appindicator3-1
+```
+
+To install both binaries from source:
+
+```sh
+cargo install --path . --features tray --bins
+```
 
 ## Basic usage
 
@@ -108,7 +143,8 @@ See [`agents/README.md`](agents/README.md) for details.
 
 ## Agent access
 
-Start the local approval daemon:
+Start the local approval daemon directly, or use `akc-tray` for visible desktop approvals and
+lifecycle controls:
 
 ```sh
 akc daemon
@@ -186,10 +222,12 @@ IPC access is limited to the daemon's OS user on Unix. A scoped grant is authori
 unguessable capability token plus exact selectors. Agent names, executable identity, and request context remain
 client-supplied labels; they are sanitized for terminal/audit output and MUST NOT be treated as a
 verified executable identity. Where supported, the audit PID is replaced with the OS-reported peer PID.
-Requests are newline-framed, limited to 16 KiB, and subject to five-second I/O timeouts.
+Requests are newline-framed and limited to 16 KiB. Non-interactive IPC operations have five-second
+I/O timeouts; an interactive secret request has a 60-second response window.
 Protocol version 2 adds random request IDs and structured error codes for retry-safe correlation.
-On Windows, endpoint access relies on the named pipe ACL inherited from the daemon process; the
-interactive approval remains the authorization boundary.
+On Windows, endpoint access relies on the named pipe ACL inherited from the daemon process. Tray
+approval decisions travel over an in-process channel owned by the daemon's approval provider; no
+public IPC command can approve a pending request.
 
 ## Vault persistence and audit rotation
 
