@@ -1,8 +1,8 @@
 cask "agent-keychain" do
-  version "0.2.0"
+  version "0.3.0"
   # Update this digest from akc-aarch64-apple-darwin.tar.gz.sha256 in the
   # corresponding GitHub release whenever version changes.
-  sha256 "49867d7b7e778ab85658ccd50b8705503c7b3e932f33515dfe134b5ee531380b"
+  sha256 "c19c2ec3167e4a727a4c3da46333a9e220a65137ad29d2bbcb06395d3a38a01e"
 
   url "https://github.com/Goooooooooody/agent-keychain/releases/download/v#{version}/akc-aarch64-apple-darwin.tar.gz"
   name "Agent Keychain"
@@ -12,4 +12,5 @@ cask "agent-keychain" do
   depends_on arch: :arm64
 
   binary "akc"
+  binary "akc-tray"
 end
