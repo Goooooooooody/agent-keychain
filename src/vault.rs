@@ -510,6 +510,7 @@ fn audit_event_digest(event: &AuditEvent) -> String {
 fn validate_audit_chain(vault: &Vault, archived: &[AuditEvent]) -> Result<()> {
     let mut predecessor: Option<String> = None;
     let mut count = 0u64;
+    let mut chained_count = 0u64;
     let mut saw_legacy = false;
     for event in archived.iter().chain(&vault.audit) {
         count = count
@@ -519,9 +520,12 @@ fn validate_audit_chain(vault: &Vault, archived: &[AuditEvent]) -> Result<()> {
             (None, None) => {
                 // Version-1 archives are authenticated individually but were not chained. They
                 // remain readable only as a legacy prefix; `akc rekey` rewrites them into the
-                // current chain format.
+                // current chain format. They cannot be predecessors because the first event
+                // written after an upgrade correctly starts a new chain from `None`.
+                if chained_count != 0 {
+                    return Err(anyhow!("legacy audit event after chained event {count}"));
+                }
                 saw_legacy = true;
-                predecessor = Some(audit_event_digest(event));
             }
             (actual_predecessor, Some(actual_digest)) => {
                 if actual_predecessor != &predecessor {
@@ -532,11 +536,15 @@ fn validate_audit_chain(vault: &Vault, archived: &[AuditEvent]) -> Result<()> {
                     return Err(anyhow!("audit chain digest mismatch at event {count}"));
                 }
                 predecessor = Some(actual_digest.clone());
+                chained_count = chained_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("audit count overflow"))?;
             }
             _ => return Err(anyhow!("incomplete audit chain metadata at event {count}")),
         }
     }
-    if !saw_legacy && (vault.audit_count != count || vault.audit_head != predecessor) {
+    let expected_count = if saw_legacy { chained_count } else { count };
+    if vault.audit_count != expected_count || vault.audit_head != predecessor {
         return Err(anyhow!(
             "audit chain count/head mismatch; history may be missing or reordered"
         ));
@@ -1762,6 +1770,28 @@ mod tests {
             .list_names()
             .contains(&"must-not-leak".into()));
         assert_eq!(store.audit_archive_count().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn audit_chain_accepts_first_chained_event_after_legacy_prefix() {
+        let mut vault = Vault::default();
+        for _ in 0..14 {
+            vault.audit.push(AuditEvent {
+                at: Utc::now(),
+                action: AuditAction::Get,
+                secret_name: None,
+                actor: "legacy".into(),
+                detail: None,
+                peer_pid: None,
+                predecessor_digest: None,
+                digest: None,
+            });
+        }
+
+        vault.audit(AuditAction::Get, None, "user", None);
+
+        assert_eq!(vault.audit[14].predecessor_digest, None);
+        validate_audit_chain(&vault, &[]).unwrap();
     }
 
     #[test]
