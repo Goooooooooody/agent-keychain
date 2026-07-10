@@ -29,7 +29,9 @@ brew tap Goooooooooody/agent-keychain https://github.com/Goooooooooody/agent-key
 brew install --cask Goooooooooody/agent-keychain/agent-keychain
 ```
 
-The cask installs a prebuilt Apple Silicon macOS binary and does not require Xcode or Cargo. Homebrew links `akc` into its prefix automatically.
+The cask installs a prebuilt Apple Silicon macOS binary and does not require Xcode or Cargo.
+Homebrew links `akc` into its prefix automatically. A release containing the desktop companion
+will also link `akc-tray` after the cask version and checksum are updated for that release.
 
 If your shell cannot find `akc` after installation, add Homebrew to your PATH:
 
@@ -45,10 +47,43 @@ Windows is supported for the CLI, encrypted vault operations, TUI, daemon, and a
 For now, install from a tagged GitHub release artifact or build from source with Rust:
 
 ```powershell
-cargo install --git https://github.com/Goooooooooody/agent-keychain.git --tag v0.2.0
+cargo install --git https://github.com/Goooooooooody/agent-keychain.git --tag v0.3.0
 ```
 
-The command remains `akc.exe` on Windows.
+The command remains `akc.exe` on Windows. Releases containing the desktop companion also include
+`akc-tray.exe`.
+
+## Desktop tray approvals
+
+`akc-tray` runs the daemon as a menu-bar app on macOS, a system-tray app on Linux, and a
+notification-area app on Windows. It starts the daemon locked, sends native notifications for
+secret requests, and opens a trusted approval dialog showing the agent label, secret name, reason,
+command context, and OS-reported process ID. Secret values and capability tokens are never shown in
+notifications or dialogs.
+
+Launch it after installing a release archive:
+
+```sh
+akc-tray
+```
+
+The tray menu provides **Start daemon**, **Unlock**, **Lock**, **Stop daemon**, and **Launch at
+login** controls. Approval dialogs default to denial and time out after 60 seconds. Starting the
+tray companion replaces an already-running terminal daemon so the trusted tray process becomes the
+approval provider.
+
+Linux requires a desktop notification service, Zenity or KDialog, GTK 3, XDo, and AppIndicator.
+For Debian or Ubuntu:
+
+```sh
+sudo apt install zenity libgtk-3-0 libxdo3 libayatana-appindicator3-1
+```
+
+To install both binaries from source:
+
+```sh
+cargo install --path . --features tray --bins
+```
 
 ## Basic usage
 
@@ -90,7 +125,9 @@ You can ask your agent to install Agent Keychain support from this repository. I
 - an agent skill at `~/.codex/skills/agent-keychain/SKILL.md`
 - an agent hook at `~/.codex/hooks/agent-keychain-secret-access.*`
 
-That hook does **not** bypass security. It wraps `akc agent-get`, so requests still go through daemon approval or an explicit scoped grant, and fetches are still audited with the agent label and reason.
+That hook does **not** bypass security. It provides audited fuzzy name discovery through
+`akc agent-search` and wraps `akc agent-get`, so value requests still go through daemon approval or
+an explicit scoped grant.
 
 Install manually if preferred:
 
@@ -108,7 +145,8 @@ See [`agents/README.md`](agents/README.md) for details.
 
 ## Agent access
 
-Start the local approval daemon:
+Start the local approval daemon directly, or use `akc-tray` for visible desktop approvals and
+lifecycle controls:
 
 ```sh
 akc daemon
@@ -119,6 +157,20 @@ Then an agent/client can request a one-time secret read:
 ```sh
 akc agent-get --name secret-for-thing --agent codex --reason 'deploy token needed'
 ```
+
+If the exact name is unknown, the agent can fuzzy-search eligible secret names without retrieving
+values:
+
+```sh
+akc agent-search --query 'github production' --agent codex \
+  --reason 'find the deployment credential' --json
+```
+
+Search requires an unlocked daemon and a query of at least two characters. It returns at most ten
+non-expired names whose `allowed_clients` policy permits the supplied agent label. It never returns
+values, tags, notes, URLs, or capability tokens. Every search is audited with the OS-reported peer
+PID, agent label, query, reason, and match count. Agent labels remain self-reported policy selectors,
+not verified executable identities.
 
 Multiple `--name` values form a batch with one approval prompt:
 
@@ -186,10 +238,12 @@ IPC access is limited to the daemon's OS user on Unix. A scoped grant is authori
 unguessable capability token plus exact selectors. Agent names, executable identity, and request context remain
 client-supplied labels; they are sanitized for terminal/audit output and MUST NOT be treated as a
 verified executable identity. Where supported, the audit PID is replaced with the OS-reported peer PID.
-Requests are newline-framed, limited to 16 KiB, and subject to five-second I/O timeouts.
+Requests are newline-framed and limited to 16 KiB. Non-interactive IPC operations have five-second
+I/O timeouts; an interactive secret request has a 60-second response window.
 Protocol version 2 adds random request IDs and structured error codes for retry-safe correlation.
-On Windows, endpoint access relies on the named pipe ACL inherited from the daemon process; the
-interactive approval remains the authorization boundary.
+On Windows, endpoint access relies on the named pipe ACL inherited from the daemon process. Tray
+approval decisions travel over an in-process channel owned by the daemon's approval provider; no
+public IPC command can approve a pending request.
 
 ## Vault persistence and audit rotation
 

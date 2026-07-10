@@ -19,6 +19,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (2026-06-30)
         with:
           components: clippy, rustfmt
+      - name: Install Linux tray dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
       - name: Check formatting
         run: cargo fmt --check
       - name: Lint
@@ -26,7 +30,13 @@ jobs:
       - name: Install pinned security auditor
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit dependencies
-        run: cargo audit
+        # wayland-scanner 0.31.10 pins quick-xml ^0.39 and only parses trusted,
+        # dependency-owned protocol XML at build time. Remove these ignores as soon as
+        # wayland-scanner publishes a release compatible with quick-xml >=0.41.
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
 
   test:
     name: Test (${{ matrix.os }})
@@ -38,5 +48,10 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (2026-06-30)
+      - name: Install Linux tray dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --all-features

@@ -117,6 +117,7 @@ pub enum AuditAction {
     Get,
     Remove,
     AgentRequest,
+    AgentSearch,
     AgentApprove,
     AgentDeny,
     AgentError,
@@ -348,6 +349,39 @@ impl Vault {
         names
     }
 
+    pub fn search_names_for_agent(&self, query: &str, agent: &str, limit: usize) -> Vec<String> {
+        let now = Utc::now();
+        let mut matches: Vec<_> = self
+            .records
+            .iter()
+            .filter(|record| {
+                record
+                    .metadata
+                    .expires_at
+                    .is_none_or(|expires_at| expires_at > now)
+                    && (record.metadata.allowed_clients.is_empty()
+                        || record
+                            .metadata
+                            .allowed_clients
+                            .iter()
+                            .any(|allowed| allowed == agent))
+            })
+            .filter_map(|record| {
+                fuzzy_name_score(&record.name, query).map(|score| (score, record.name.clone()))
+            })
+            .collect();
+        matches.sort_by(|(left_score, left_name), (right_score, right_name)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| left_name.cmp(right_name))
+        });
+        matches
+            .into_iter()
+            .take(limit.min(20))
+            .map(|(_, name)| name)
+            .collect()
+    }
+
     pub fn list_records(&self) -> Vec<&SecretRecord> {
         let mut records: Vec<_> = self.records.iter().collect();
         records.sort_by(|a, b| a.name.cmp(&b.name));
@@ -390,6 +424,79 @@ impl Vault {
     }
 }
 
+fn fuzzy_name_score(name: &str, query: &str) -> Option<usize> {
+    let normalized_name = name.to_lowercase();
+    let words: Vec<_> = normalized_name
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let tokens: Vec<_> = query
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    tokens.into_iter().try_fold(0usize, |total, token| {
+        fuzzy_token_score(&normalized_name, &words, &token)
+            .and_then(|score| total.checked_add(score))
+    })
+}
+
+fn fuzzy_token_score(name: &str, words: &[&str], token: &str) -> Option<usize> {
+    if name == token {
+        return Some(0);
+    }
+    if let Some(position) = name.find(token) {
+        return Some(10 + position + name.len().saturating_sub(token.len()));
+    }
+    if let Some(score) = words
+        .iter()
+        .filter_map(|word| {
+            if *word == token {
+                Some(1)
+            } else if word.starts_with(token) {
+                Some(5 + word.len().saturating_sub(token.len()))
+            } else {
+                let distance = levenshtein_distance(word, token);
+                let threshold = 2usize.max(token.chars().count() / 3);
+                (distance <= threshold).then_some(20 + distance * 5)
+            }
+        })
+        .min()
+    {
+        return Some(score);
+    }
+    let mut token_chars = token.chars();
+    let mut next = token_chars.next();
+    let mut gaps = 0usize;
+    for character in name.chars() {
+        match next {
+            Some(expected) if expected == character => next = token_chars.next(),
+            Some(_) => gaps = gaps.saturating_add(1),
+            None => break,
+        }
+    }
+    next.is_none().then_some(40 + gaps)
+}
+
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_character) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_character) in right.iter().enumerate() {
+            current[right_index + 1] = (current[right_index] + 1)
+                .min(previous[right_index + 1] + 1)
+                .min(previous[right_index] + usize::from(left_character != *right_character));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
 fn audit_event_digest(event: &AuditEvent) -> String {
     let mut canonical = event.clone();
     canonical.digest = None;
@@ -403,6 +510,7 @@ fn audit_event_digest(event: &AuditEvent) -> String {
 fn validate_audit_chain(vault: &Vault, archived: &[AuditEvent]) -> Result<()> {
     let mut predecessor: Option<String> = None;
     let mut count = 0u64;
+    let mut chained_count = 0u64;
     let mut saw_legacy = false;
     for event in archived.iter().chain(&vault.audit) {
         count = count
@@ -412,9 +520,12 @@ fn validate_audit_chain(vault: &Vault, archived: &[AuditEvent]) -> Result<()> {
             (None, None) => {
                 // Version-1 archives are authenticated individually but were not chained. They
                 // remain readable only as a legacy prefix; `akc rekey` rewrites them into the
-                // current chain format.
+                // current chain format. They cannot be predecessors because the first event
+                // written after an upgrade correctly starts a new chain from `None`.
+                if chained_count != 0 {
+                    return Err(anyhow!("legacy audit event after chained event {count}"));
+                }
                 saw_legacy = true;
-                predecessor = Some(audit_event_digest(event));
             }
             (actual_predecessor, Some(actual_digest)) => {
                 if actual_predecessor != &predecessor {
@@ -425,11 +536,15 @@ fn validate_audit_chain(vault: &Vault, archived: &[AuditEvent]) -> Result<()> {
                     return Err(anyhow!("audit chain digest mismatch at event {count}"));
                 }
                 predecessor = Some(actual_digest.clone());
+                chained_count = chained_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("audit count overflow"))?;
             }
             _ => return Err(anyhow!("incomplete audit chain metadata at event {count}")),
         }
     }
-    if !saw_legacy && (vault.audit_count != count || vault.audit_head != predecessor) {
+    let expected_count = if saw_legacy { chained_count } else { count };
+    if vault.audit_count != expected_count || vault.audit_head != predecessor {
         return Err(anyhow!(
             "audit chain count/head mismatch; history may be missing or reordered"
         ));
@@ -1360,6 +1475,48 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_agent_search_ranks_names_and_filters_ineligible_records() {
+        let mut vault = Vault::new();
+        vault
+            .add_secret("github-production-token".into(), "one".into())
+            .unwrap();
+        vault
+            .add_secret("github-staging-token".into(), "two".into())
+            .unwrap();
+        vault
+            .add_secret_with_metadata(
+                "github-private-token".into(),
+                "three".into(),
+                SecretMetadata {
+                    allowed_clients: vec!["other-agent".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        vault
+            .add_secret_with_metadata(
+                "github-expired-token".into(),
+                "four".into(),
+                SecretMetadata {
+                    expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let matches = vault.search_names_for_agent("githb prod", "codex", 10);
+        let broad_matches = vault.search_names_for_agent("githb token", "codex", 10);
+
+        assert_eq!(
+            matches.first().map(String::as_str),
+            Some("github-production-token")
+        );
+        assert!(broad_matches.contains(&"github-staging-token".to_string()));
+        assert!(!broad_matches.iter().any(|name| name.contains("private")));
+        assert!(!broad_matches.iter().any(|name| name.contains("expired")));
+    }
+
+    #[test]
     fn verified_backup_restore_and_rekey_round_trip() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("vault.db");
@@ -1613,6 +1770,28 @@ mod tests {
             .list_names()
             .contains(&"must-not-leak".into()));
         assert_eq!(store.audit_archive_count().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn audit_chain_accepts_first_chained_event_after_legacy_prefix() {
+        let mut vault = Vault::default();
+        for _ in 0..14 {
+            vault.audit.push(AuditEvent {
+                at: Utc::now(),
+                action: AuditAction::Get,
+                secret_name: None,
+                actor: "legacy".into(),
+                detail: None,
+                peer_pid: None,
+                predecessor_digest: None,
+                digest: None,
+            });
+        }
+
+        vault.audit(AuditAction::Get, None, "user", None);
+
+        assert_eq!(vault.audit[14].predecessor_digest, None);
+        validate_audit_chain(&vault, &[]).unwrap();
     }
 
     #[test]

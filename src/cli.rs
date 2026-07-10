@@ -1,7 +1,8 @@
 use crate::config::ConfigStore;
 use crate::daemon::{
     daemon_status, disable_grants, enable_grant, grant_status, lock_daemon, request_secret,
-    request_secrets, run_daemon, stop_daemon, unlock_daemon, AgentResponse, BatchSecretResult,
+    request_secrets, run_daemon, search_secret_names, stop_daemon, unlock_daemon, AgentResponse,
+    BatchSecretResult,
 };
 use crate::paths::{config_path, socket_path, vault_path};
 use crate::tui::run_tui;
@@ -86,6 +87,17 @@ pub enum Command {
         reason: Option<String>,
         #[arg(long)]
         command_context: Option<String>,
+    },
+    /// Fuzzy-search eligible secret names through the audited daemon without returning values.
+    AgentSearch {
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value = "agent")]
+        agent: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Supply one approved secret to a command through its standard input, never argv/env/stdout.
     Exec {
@@ -285,6 +297,25 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 _ => Err(anyhow!("unexpected daemon response")),
             }
         }
+        Command::AgentSearch {
+            query,
+            agent,
+            reason,
+            json,
+        } => match search_secret_names(socket_path()?, agent, query, reason)? {
+            AgentResponse::SearchResults { names } => {
+                if json {
+                    println!("{}", serde_json::to_string(&names)?);
+                } else {
+                    for name in names {
+                        println!("{name}");
+                    }
+                }
+                Ok(())
+            }
+            AgentResponse::Error { message, .. } => Err(anyhow!(message)),
+            _ => Err(anyhow!("unexpected daemon response")),
+        },
         Command::Exec { secret, command } => exec_with_secret(secret, command),
         Command::Rekey {
             memory_kib,
@@ -463,6 +494,7 @@ fn parse_audit_action(value: &str) -> Result<AuditAction> {
             "get" => AuditAction::Get,
             "remove" => AuditAction::Remove,
             "request" | "agent_request" => AuditAction::AgentRequest,
+            "search" | "agent_search" => AuditAction::AgentSearch,
             "approve" | "agent_approve" => AuditAction::AgentApprove,
             "deny" | "agent_deny" => AuditAction::AgentDeny,
             "error" | "agent_error" => AuditAction::AgentError,
@@ -744,6 +776,31 @@ fn require_interactive_terminal() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_search_cli_captures_query_identity_reason_and_json_mode() {
+        let cli = Cli::try_parse_from([
+            "akc",
+            "agent-search",
+            "--query",
+            "github prod",
+            "--agent",
+            "codex",
+            "--reason",
+            "deploy",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::AgentSearch {
+                query,
+                agent,
+                reason: Some(reason),
+                json: true,
+            }) if query == "github prod" && agent == "codex" && reason == "deploy"
+        ));
+    }
 
     #[cfg(unix)]
     #[test]
