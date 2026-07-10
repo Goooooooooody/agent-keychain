@@ -30,7 +30,13 @@ jobs:
       - name: Install pinned security auditor
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit dependencies
-        run: cargo audit
+        # wayland-scanner 0.31.10 pins quick-xml ^0.39 and only parses trusted,
+        # dependency-owned protocol XML at build time. Remove these ignores as soon as
+        # wayland-scanner publishes a release compatible with quick-xml >=0.41.
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
 
   test:
     name: Test (${{ matrix.os }})
