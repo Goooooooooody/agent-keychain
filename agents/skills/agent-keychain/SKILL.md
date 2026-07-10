@@ -1,12 +1,12 @@
 ---
 name: agent-keychain
 description: >
-  Request secrets from Agent Keychain without bypassing user approval or audit logging.
-  Trigger: When an agent needs a password, API token, credential, key, or secret stored in akc.
+  Discover and request secrets from Agent Keychain without bypassing policy, user approval, or audit logging.
+  Trigger: When an agent needs to find or use a password, API token, credential, key, or secret stored in akc.
 license: Apache-2.0
 metadata:
   author: goody
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## When to Use
@@ -17,12 +17,21 @@ Use this skill when a task requires a secret that may be stored in Agent Keychai
 
 - NEVER ask the user to paste a secret into chat if `akc` can provide it.
 - NEVER use `akc get` for agent access. That is the direct human CLI path.
-- ALWAYS request secrets with `akc agent-get` or the installed hook wrapper.
+- If the exact secret name is unknown, use `akc agent-search` or the installed search helper. Do not guess repeatedly or enumerate names.
+- Search queries MUST contain at least two characters and SHOULD include meaningful service, environment, or purpose terms.
+- Search returns eligible secret names only—never values, notes, URLs, or capability tokens. Results are bounded and audited.
+- ALWAYS request the selected secret with `akc agent-get` or the installed hook wrapper.
 - ALWAYS include a concrete reason with the request.
 - Treat returned secrets as ephemeral: use once, do not store in files, logs, memory notes, commits, or summaries.
 - If the daemon denies access or is not running, tell the user exactly what failed and do not work around the approval flow.
 
 ## Commands
+
+Find an eligible secret name without retrieving its value:
+
+```bash
+akc agent-search --query "<service environment purpose>" --agent "${AKC_AGENT_NAME:-agent}" --reason "<why this task needs discovery>" --json
+```
 
 Request a secret directly:
 
@@ -34,6 +43,7 @@ Using the installed shell hook:
 
 ```bash
 source "${CODEX_HOME:-$HOME/.codex}/hooks/agent-keychain-secret-access.sh"
+akc_secret_search "github production" "find the deployment credential"
 akc_secret_get <secret-name> "<why this task needs it>"
 ```
 
@@ -41,6 +51,7 @@ Using the installed PowerShell hook:
 
 ```powershell
 . "$env:USERPROFILE\.codex\hooks\agent-keychain-secret-access.ps1"
+Find-AkcSecret -Query "github production" -Reason "find the deployment credential"
 Get-AkcSecret -Name "<secret-name>" -Reason "<why this task needs it>"
 ```
 

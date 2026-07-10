@@ -24,6 +24,8 @@ const MAX_AGENT_CHARS: usize = 128;
 const MAX_SECRET_NAME_CHARS: usize = 256;
 const MAX_REASON_CHARS: usize = 1024;
 const MAX_CONTEXT_CHARS: usize = 4096;
+const MAX_SEARCH_QUERY_CHARS: usize = 128;
+const MAX_SEARCH_RESULTS: usize = 10;
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_COUNT: usize = 4;
 const CONNECTION_QUEUE: usize = 16;
@@ -46,6 +48,11 @@ pub enum AgentCommand {
         command_context: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grant_token: Option<String>,
+    },
+    SearchSecrets {
+        agent: String,
+        query: String,
+        reason: Option<String>,
     },
     EnableGrant {
         passphrase: String,
@@ -160,6 +167,9 @@ pub enum AgentResponse {
     },
     Batch {
         results: Vec<BatchSecretResult>,
+    },
+    SearchResults {
+        names: Vec<String>,
     },
     Denied {
         message: String,
@@ -498,6 +508,22 @@ pub fn request_secret(
     )
 }
 
+pub fn search_secret_names(
+    socket_path: PathBuf,
+    agent: String,
+    query: String,
+    reason: Option<String>,
+) -> Result<AgentResponse> {
+    send_request(
+        socket_path,
+        &AgentCommand::SearchSecrets {
+            agent,
+            query,
+            reason,
+        },
+    )
+}
+
 pub fn enable_grant(
     socket_path: PathBuf,
     mut passphrase: String,
@@ -557,6 +583,7 @@ pub fn run_daemon(vault_path: PathBuf, socket_path: PathBuf, config_path: PathBu
         socket_path,
         config_path,
         Arc::new(TerminalApprovalProvider),
+        false,
     )
 }
 
@@ -572,6 +599,7 @@ pub fn run_daemon_locked_with_approval(
         socket_path,
         config_path,
         approval_provider,
+        true,
     )
 }
 
@@ -581,6 +609,7 @@ fn run_daemon_inner(
     socket_path: PathBuf,
     config_path: PathBuf,
     approval_provider: Arc<dyn ApprovalProvider>,
+    overwrite_stale_endpoint: bool,
 ) -> Result<()> {
     let config_store = ConfigStore::new(config_path);
     let config = config_store.load()?;
@@ -594,8 +623,13 @@ fn run_daemon_inner(
         }
     }
     let name = ipc_name(socket_path.clone())?;
-    let listener = ListenerOptions::new()
-        .name(name)
+    let mut listener_options = ListenerOptions::new().name(name);
+    if overwrite_stale_endpoint {
+        listener_options = listener_options
+            .try_overwrite(true)
+            .max_spin_time(Duration::from_millis(250));
+    }
+    let listener = listener_options
         .create_sync()
         .with_context(|| format!("bind local IPC endpoint {}", ipc_display(&socket_path)))?;
     listener.set_nonblocking(ListenerNonblockingMode::Both)?;
@@ -942,6 +976,11 @@ fn handle_command(
             }
             handle_get_secrets(state, requests, peer, approval)
         }
+        AgentCommand::SearchSecrets {
+            agent,
+            query,
+            reason,
+        } => handle_search_secrets(state, agent, query, reason, peer),
         AgentCommand::EnableGrant {
             mut passphrase,
             client_label,
@@ -1016,6 +1055,66 @@ fn handle_command(
                 message: "daemon stopping".into(),
             }
         }
+    }
+}
+
+fn handle_search_secrets(
+    state: &mut DaemonState,
+    agent: String,
+    query: String,
+    reason: Option<String>,
+    peer: PeerIdentity,
+) -> AgentResponse {
+    if state.session.is_none() {
+        return error_response(
+            ErrorCode::Locked,
+            "daemon is locked; unlock it before searching secret names",
+        );
+    }
+    if let Err(error) = validate_field("agent", &agent, MAX_AGENT_CHARS, false) {
+        return error_response(ErrorCode::InvalidRequest, error);
+    }
+    let query = query.trim();
+    if query.chars().count() < 2 {
+        return error_response(
+            ErrorCode::InvalidRequest,
+            "search query must contain at least two characters",
+        );
+    }
+    if let Err(error) = validate_field("query", query, MAX_SEARCH_QUERY_CHARS, true) {
+        return error_response(ErrorCode::InvalidRequest, error);
+    }
+    if let Some(reason) = &reason {
+        if let Err(error) = validate_field("reason", reason, MAX_REASON_CHARS, false) {
+            return error_response(ErrorCode::InvalidRequest, error);
+        }
+    }
+    let agent = terminal_safe(&agent);
+    let query = terminal_safe(query);
+    let reason = reason.as_deref().map(terminal_safe);
+    let Some(session) = state.session.as_mut() else {
+        return error_response(ErrorCode::Locked, "daemon is locked");
+    };
+    match session.transaction(|vault| {
+        let names = vault.search_names_for_agent(&query, &agent, MAX_SEARCH_RESULTS);
+        let mut detail = format!("fuzzy name query: {query}; matches: {}", names.len());
+        if let Some(reason) = &reason {
+            detail.push_str(&format!("; reason: {reason}"));
+        }
+        vault.audit_with_peer(
+            AuditAction::AgentSearch,
+            None,
+            &agent,
+            Some(detail),
+            peer.pid,
+        );
+        Ok(names)
+    }) {
+        Ok(names) => AgentResponse::SearchResults { names },
+        Err(error) => error_response(
+            ErrorCode::PersistenceFailed,
+            format!("search audit persistence failed: {error:#}"),
+        ),
     }
 }
 
@@ -1814,6 +1913,67 @@ mod tests {
         assert!(!serde_json::to_string(&prompt)
             .unwrap()
             .contains("must-not-leak"));
+    }
+
+    #[test]
+    fn agent_search_returns_names_only_and_is_audited() {
+        let (_temp, mut state) = state_with_secret();
+        let peer = PeerIdentity {
+            pid: Some(456),
+            principal: 42,
+        };
+
+        let response = handle_search_secrets(
+            &mut state,
+            "codex".into(),
+            "thng".into(),
+            Some("find deployment credential".into()),
+            peer,
+        );
+
+        assert_eq!(
+            response,
+            AgentResponse::SearchResults {
+                names: vec!["thing".into()]
+            }
+        );
+        let session = state.session.as_ref().unwrap();
+        assert_eq!(session.revision(), 3);
+        let events = state
+            .store
+            .audit_events(
+                "correct",
+                &crate::vault::AuditFilter {
+                    actor: Some("codex".into()),
+                    action: Some(AuditAction::AgentSearch),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].peer_pid, Some(456));
+    }
+
+    #[test]
+    fn agent_search_rejects_enumeration_queries() {
+        let (_temp, mut state) = state_with_secret();
+        let response = handle_search_secrets(
+            &mut state,
+            "codex".into(),
+            "t".into(),
+            None,
+            PeerIdentity {
+                pid: Some(456),
+                principal: 42,
+            },
+        );
+        assert!(matches!(
+            response,
+            AgentResponse::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            }
+        ));
     }
     #[test]
     fn scoped_grant_expires_and_honors_use_limit_and_selector() {

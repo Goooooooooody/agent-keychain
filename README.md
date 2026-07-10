@@ -125,7 +125,9 @@ You can ask your agent to install Agent Keychain support from this repository. I
 - an agent skill at `~/.codex/skills/agent-keychain/SKILL.md`
 - an agent hook at `~/.codex/hooks/agent-keychain-secret-access.*`
 
-That hook does **not** bypass security. It wraps `akc agent-get`, so requests still go through daemon approval or an explicit scoped grant, and fetches are still audited with the agent label and reason.
+That hook does **not** bypass security. It provides audited fuzzy name discovery through
+`akc agent-search` and wraps `akc agent-get`, so value requests still go through daemon approval or
+an explicit scoped grant.
 
 Install manually if preferred:
 
@@ -155,6 +157,20 @@ Then an agent/client can request a one-time secret read:
 ```sh
 akc agent-get --name secret-for-thing --agent codex --reason 'deploy token needed'
 ```
+
+If the exact name is unknown, the agent can fuzzy-search eligible secret names without retrieving
+values:
+
+```sh
+akc agent-search --query 'github production' --agent codex \
+  --reason 'find the deployment credential' --json
+```
+
+Search requires an unlocked daemon and a query of at least two characters. It returns at most ten
+non-expired names whose `allowed_clients` policy permits the supplied agent label. It never returns
+values, tags, notes, URLs, or capability tokens. Every search is audited with the OS-reported peer
+PID, agent label, query, reason, and match count. Agent labels remain self-reported policy selectors,
+not verified executable identities.
 
 Multiple `--name` values form a batch with one approval prompt:
 

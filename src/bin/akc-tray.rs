@@ -10,10 +10,12 @@ use auto_launch::{
     AutoLaunch, AutoLaunchBuilder, LinuxLaunchMode, MacOSLaunchMode, WindowsEnableMode,
 };
 use notify_rust::Notification;
+use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
-use tinyfiledialogs::{MessageBoxIcon, YesNo};
+use sysinfo::System;
+use tinyfiledialogs::MessageBoxIcon;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use winit::application::ApplicationHandler;
@@ -166,6 +168,7 @@ impl Application {
                         thread::sleep(Duration::from_millis(50));
                     }
                 }
+                terminate_existing_daemons();
                 run_daemon_locked_with_approval(
                     vault_path()?,
                     socket,
@@ -204,43 +207,6 @@ impl Application {
         });
     }
 
-    fn show_approval(&self, prompt: ApprovalPrompt) -> ApprovalDecision {
-        let secret_label = if prompt.secret_names.len() == 1 {
-            format!("Secret: {}", prompt.secret_names[0])
-        } else {
-            format!("Secrets: {}", prompt.secret_names.join(", "))
-        };
-        let body = format!(
-            "Agent: {}\n{}\nReason: {}\nCommand: {}\nProcess: {}\n\nApprove this request once?",
-            prompt.agent,
-            secret_label,
-            prompt.reason.as_deref().unwrap_or("Not provided"),
-            prompt.command_context.as_deref().unwrap_or("Not provided"),
-            prompt
-                .pid
-                .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "Unavailable".into()),
-        );
-        let _ = Notification::new()
-            .summary("Agent Keychain approval required")
-            .body(&format!(
-                "{} requests access to {}",
-                prompt.agent, secret_label
-            ))
-            .show();
-        if tinyfiledialogs::message_box_yes_no(
-            "Agent Keychain — approval required",
-            &body,
-            MessageBoxIcon::Question,
-            YesNo::No,
-        ) == YesNo::Yes
-        {
-            ApprovalDecision::ApproveOnce
-        } else {
-            ApprovalDecision::Deny
-        }
-    }
-
     fn handle_menu(&mut self, event_loop: &ActiveEventLoop, event: MenuEvent) {
         let Some(menu) = &self.menu else {
             return;
@@ -249,19 +215,19 @@ impl Application {
         if TrayMenu::matches(id, &menu.start) {
             self.start_daemon();
         } else if TrayMenu::matches(id, &menu.unlock) {
-            if let Some(passphrase) = tinyfiledialogs::password_box(
-                "Unlock Agent Keychain",
-                "Enter the vault passphrase. It is sent only to the local daemon.",
-            ) {
-                let proxy = self.proxy.clone();
-                thread::spawn(move || {
+            let proxy = self.proxy.clone();
+            thread::spawn(move || {
+                if let Some(passphrase) = tinyfiledialogs::password_box(
+                    "Unlock Agent Keychain",
+                    "Enter the vault passphrase. It is sent only to the local daemon.",
+                ) {
                     let status = socket_path()
                         .and_then(|socket| unlock_daemon(socket, passphrase))
                         .and_then(|_| socket_path().and_then(daemon_status))
                         .map_err(|error| format!("{error:#}"));
                     let _ = proxy.send_event(UserEvent::Status(status));
-                });
-            }
+                }
+            });
         } else if TrayMenu::matches(id, &menu.lock) {
             let proxy = self.proxy.clone();
             thread::spawn(move || {
@@ -337,9 +303,15 @@ impl ApplicationHandler<UserEvent> for Application {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Approval { prompt, response } => {
-                let decision = self.show_approval(prompt);
-                let _ = response.send(decision);
-                self.refresh_status();
+                let proxy = self.proxy.clone();
+                thread::spawn(move || {
+                    let decision = show_approval(prompt);
+                    let _ = response.send(decision);
+                    let status = socket_path()
+                        .and_then(daemon_status)
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = proxy.send_event(UserEvent::Status(status));
+                });
             }
             UserEvent::Menu(event) => self.handle_menu(event_loop, event),
             UserEvent::Tray(_event) => {}
@@ -397,6 +369,26 @@ fn auto_launcher() -> Result<AutoLaunch> {
     builder.build().map_err(Into::into)
 }
 
+fn terminate_existing_daemons() {
+    let system = System::new_all();
+    let mut killed = false;
+    for process in system.processes().values() {
+        if is_akc_daemon(process.name(), process.cmd()) {
+            killed |= process.kill();
+        }
+    }
+    if killed {
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn is_akc_daemon(name: &std::ffi::OsStr, command: &[std::ffi::OsString]) -> bool {
+    matches!(
+        name.to_string_lossy().to_ascii_lowercase().as_str(),
+        "akc" | "akc.exe"
+    ) && command.iter().skip(1).any(|argument| argument == "daemon")
+}
+
 fn tray_icon_image() -> Result<Icon> {
     const SIZE: u32 = 32;
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
@@ -420,11 +412,59 @@ fn tray_icon_image() -> Result<Icon> {
 }
 
 fn show_error(message: &str) {
+    let message = message.to_owned();
+    thread::spawn(move || {
+        let _ = Notification::new()
+            .summary("Agent Keychain")
+            .body(&message)
+            .show();
+        tinyfiledialogs::message_box_ok("Agent Keychain", &message, MessageBoxIcon::Error);
+    });
+}
+
+fn show_approval(prompt: ApprovalPrompt) -> ApprovalDecision {
+    let secret_label = if prompt.secret_names.len() == 1 {
+        format!("Secret: {}", prompt.secret_names[0])
+    } else {
+        format!("Secrets: {}", prompt.secret_names.join(", "))
+    };
+    let body = format!(
+        "Agent: {}\n{}\nReason: {}\nCommand: {}\nProcess: {}\n\nApprove this request once?",
+        prompt.agent,
+        secret_label,
+        prompt.reason.as_deref().unwrap_or("Not provided"),
+        prompt.command_context.as_deref().unwrap_or("Not provided"),
+        prompt
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "Unavailable".into()),
+    );
     let _ = Notification::new()
-        .summary("Agent Keychain")
-        .body(message)
+        .summary("Agent Keychain approval required")
+        .body(&format!(
+            "{} requests access to {}",
+            prompt.agent, secret_label
+        ))
         .show();
-    tinyfiledialogs::message_box_ok("Agent Keychain", message, MessageBoxIcon::Error);
+    let result = MessageDialog::new()
+        .set_title("Agent Keychain — approval required")
+        .set_description(body)
+        .set_level(MessageLevel::Warning)
+        .set_buttons(MessageButtons::OkCancelCustom(
+            "Deny".into(),
+            "Approve once".into(),
+        ))
+        .show();
+    approval_decision_for_dialog(result)
+}
+
+fn approval_decision_for_dialog(result: MessageDialogResult) -> ApprovalDecision {
+    match result {
+        MessageDialogResult::Custom(label) if label == "Approve once" => {
+            ApprovalDecision::ApproveOnce
+        }
+        _ => ApprovalDecision::Deny,
+    }
 }
 
 fn main() -> Result<()> {
@@ -466,4 +506,43 @@ fn main() -> Result<()> {
     };
     event_loop.run_app(&mut application)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{approval_decision_for_dialog, is_akc_daemon};
+    use agent_keychain::daemon::ApprovalDecision;
+    use rfd::MessageDialogResult;
+    use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn takeover_targets_only_akc_daemon_processes() {
+        let daemon = [OsString::from("akc"), OsString::from("daemon")];
+        let request = [
+            OsString::from("akc"),
+            OsString::from("agent-get"),
+            OsString::from("--name"),
+            OsString::from("thing"),
+        ];
+        assert!(is_akc_daemon(OsStr::new("akc"), &daemon));
+        assert!(is_akc_daemon(OsStr::new("akc.exe"), &daemon));
+        assert!(!is_akc_daemon(OsStr::new("akc"), &request));
+        assert!(!is_akc_daemon(OsStr::new("akc-tray"), &daemon));
+    }
+
+    #[test]
+    fn approval_dialog_is_default_deny() {
+        assert_eq!(
+            approval_decision_for_dialog(MessageDialogResult::Cancel),
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            approval_decision_for_dialog(MessageDialogResult::Custom("Deny".into())),
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            approval_decision_for_dialog(MessageDialogResult::Custom("Approve once".into())),
+            ApprovalDecision::ApproveOnce
+        );
+    }
 }

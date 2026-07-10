@@ -16,4 +16,4 @@ printf 'Installed Agent Keychain agent access assets:\n'
 printf -- '- Skill: %s\n' "$skill_dir/SKILL.md"
 printf -- '- Shell hook: %s\n' "$hook_dir/agent-keychain-secret-access.sh"
 printf -- '- PowerShell hook: %s\n' "$hook_dir/agent-keychain-secret-access.ps1"
-printf '\nAgents should request secrets through the hook or `akc agent-get` so daemon approval and audit logging remain intact.\n'
+printf '\nAgents can discover eligible names with `akc agent-search`, then request values through the hook or `akc agent-get`; both paths remain audited.\n'
