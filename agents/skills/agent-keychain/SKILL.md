@@ -6,7 +6,7 @@ description: >
 license: Apache-2.0
 metadata:
   author: goody
-  version: "1.1"
+  version: "1.2"
 ---
 
 ## When to Use
@@ -21,6 +21,7 @@ Use this skill when a task requires a secret that may be stored in Agent Keychai
 - Search queries MUST contain at least two characters and SHOULD include meaningful service, environment, or purpose terms.
 - Search returns eligible secret names only—never values, notes, URLs, or capability tokens. Results are bounded and audited.
 - ALWAYS request the selected secret with `akc agent-get` or the installed hook wrapper.
+- When multiple secrets are known up front, request them together as one batch. Do not create avoidable sequential approval prompts.
 - ALWAYS include a concrete reason with the request.
 - Treat returned secrets as ephemeral: use once, do not store in files, logs, memory notes, commits, or summaries.
 - If the daemon denies access or is not running, tell the user exactly what failed and do not work around the approval flow.
@@ -39,12 +40,21 @@ Request a secret directly:
 akc agent-get --name <secret-name> --agent "${AKC_AGENT_NAME:-agent}" --reason "<why this task needs it>"
 ```
 
+Request 2–64 secrets with one approval prompt:
+
+```bash
+akc agent-get --name <secret-one> <secret-two> [<secret-three> ...] --agent "${AKC_AGENT_NAME:-agent}" --reason "<why this task needs them>"
+```
+
+Batch output uses `name=value`. Each item is audited and checked independently; treat every returned value as ephemeral.
+
 Using the installed shell hook:
 
 ```bash
 source "${CODEX_HOME:-$HOME/.codex}/hooks/agent-keychain-secret-access.sh"
 akc_secret_search "github production" "find the deployment credential"
 akc_secret_get <secret-name> "<why this task needs it>"
+akc_secret_get_many "<why this task needs them>" <secret-one> <secret-two> [<secret-three> ...]
 ```
 
 Using the installed PowerShell hook:
@@ -53,6 +63,7 @@ Using the installed PowerShell hook:
 . "$env:USERPROFILE\.codex\hooks\agent-keychain-secret-access.ps1"
 Find-AkcSecret -Query "github production" -Reason "find the deployment credential"
 Get-AkcSecret -Name "<secret-name>" -Reason "<why this task needs it>"
+Get-AkcSecrets -Name "<secret-one>", "<secret-two>" -Reason "<why this task needs them>"
 ```
 
 ## Resources

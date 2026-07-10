@@ -28,7 +28,9 @@ Windows PowerShell:
 
 ## How agents should request secrets
 
-Agents should use `akc agent-get` or the installed hook. They should not use `akc get`.
+Agents should use `akc agent-get` or the installed hook. They should not use `akc get`. When an
+agent needs multiple known secrets, it should request them together with multiple `--name` values,
+`akc_secret_get_many`, or `Get-AkcSecrets` so the user receives one approval prompt.
 If the exact name is unknown, they should fuzzy-search eligible names through `akc agent-search`
 instead of guessing or repeatedly requesting names.
 
