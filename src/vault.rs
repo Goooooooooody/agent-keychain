@@ -65,8 +65,8 @@ fn metadata_version() -> u8 {
     1
 }
 
-/// Versioned, non-secret policy and lifecycle information. `allowed_clients` contains
-/// self-reported labels only; it is not executable identity verification.
+/// Versioned, non-secret policy and lifecycle information. Client labels are
+/// self-reported policy selectors only; they are not executable identity verification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretMetadata {
     #[serde(default = "metadata_version")]
@@ -81,6 +81,9 @@ pub struct SecretMetadata {
     pub one_time: bool,
     #[serde(default)]
     pub allowed_clients: Vec<String>,
+    /// Clients that may read this secret without an approval prompt.
+    #[serde(default)]
+    pub auto_approve_clients: Vec<String>,
     #[serde(default)]
     pub notes: Option<String>,
     #[serde(default)]
@@ -96,6 +99,7 @@ impl Default for SecretMetadata {
             rotate_after: None,
             one_time: false,
             allowed_clients: Vec::new(),
+            auto_approve_clients: Vec::new(),
             notes: None,
             url: None,
         }
@@ -380,6 +384,42 @@ impl Vault {
             .take(limit.min(20))
             .map(|(_, name)| name)
             .collect()
+    }
+
+    pub fn auto_approved_for(&self, name: &str, agent: &str) -> bool {
+        self.records.iter().any(|record| {
+            record.name == name
+                && record
+                    .metadata
+                    .auto_approve_clients
+                    .iter()
+                    .any(|client| client == agent)
+        })
+    }
+
+    pub fn add_auto_approve_client(&mut self, name: &str, agent: &str) -> Result<()> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.name == name)
+            .ok_or_else(|| anyhow!("secret '{name}' not found"))?;
+        if !record
+            .metadata
+            .auto_approve_clients
+            .iter()
+            .any(|client| client == agent)
+        {
+            record.metadata.auto_approve_clients.push(agent.to_string());
+            validate_metadata(&mut record.metadata)?;
+            record.updated_at = Utc::now();
+            self.audit(
+                AuditAction::Update,
+                Some(name.to_string()),
+                "user",
+                Some(format!("enabled auto-approval for client '{agent}'")),
+            );
+        }
+        Ok(())
     }
 
     pub fn list_records(&self) -> Vec<&SecretRecord> {
@@ -1139,6 +1179,10 @@ impl VaultSession {
         self.vault.revision
     }
 
+    pub fn auto_approved_for(&self, name: &str, agent: &str) -> bool {
+        self.vault.auto_approved_for(name, agent)
+    }
+
     pub fn transaction<T: Zeroize>(
         &mut self,
         mutate: impl FnOnce(&mut Vault) -> Result<T>,
@@ -1384,7 +1428,12 @@ fn validate_metadata(metadata: &mut SecretMetadata) -> Result<()> {
             metadata.version
         ));
     }
-    for value in metadata.tags.iter().chain(metadata.allowed_clients.iter()) {
+    for value in metadata
+        .tags
+        .iter()
+        .chain(metadata.allowed_clients.iter())
+        .chain(metadata.auto_approve_clients.iter())
+    {
         if value.trim().is_empty()
             || value.chars().count() > 128
             || value.chars().any(char::is_control)
@@ -1409,6 +1458,8 @@ fn validate_metadata(metadata: &mut SecretMetadata) -> Result<()> {
     metadata.tags.dedup();
     metadata.allowed_clients.sort();
     metadata.allowed_clients.dedup();
+    metadata.auto_approve_clients.sort();
+    metadata.auto_approve_clients.dedup();
     Ok(())
 }
 
@@ -1452,6 +1503,16 @@ mod tests {
             .contains("not allowed"));
         assert_eq!(vault.get_secret("once", "codex", None).unwrap(), "value");
         assert!(vault.get_secret("once", "codex", None).is_err());
+    }
+
+    #[test]
+    fn auto_approval_is_scoped_to_secret_and_client() {
+        let mut vault = Vault::new();
+        vault.add_secret("local".into(), "value".into()).unwrap();
+        vault.add_auto_approve_client("local", "codex").unwrap();
+        assert!(vault.auto_approved_for("local", "codex"));
+        assert!(!vault.auto_approved_for("local", "other-agent"));
+        assert!(!vault.auto_approved_for("missing", "codex"));
     }
 
     #[test]

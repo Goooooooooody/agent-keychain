@@ -16,7 +16,7 @@ The only updates this tool will recieve is the above mentioned connector, and se
 - V1 is local-only: no cloud service and no network listener.
 - Agent access goes through a local IPC daemon: Unix domain sockets on macOS/Linux and named pipes on Windows.
 - Agents do not receive blanket access. Each request is approved or denied by the user unless a
-  time- and use-bounded grant matches its OS principal, client label, and secret name.
+  time- and use-bounded grant or an explicit per-secret auto-approval policy matches its client label.
 - Requests and approvals are written to the vault audit log.
 
 
@@ -47,7 +47,7 @@ Windows is supported for the CLI, encrypted vault operations, TUI, daemon, and a
 For now, install from a tagged GitHub release artifact or build from source with Rust:
 
 ```powershell
-cargo install --git https://github.com/Goooooooooody/agent-keychain.git --tag v0.3.0
+cargo install --git https://github.com/Goooooooooody/agent-keychain.git --tag v0.4.0
 ```
 
 The command remains `akc.exe` on Windows. Releases containing the desktop companion also include
@@ -71,6 +71,10 @@ The tray menu provides **Start daemon**, **Unlock**, **Lock**, **Stop daemon**, 
 login** controls. Approval dialogs default to denial and time out after 60 seconds. Starting the
 tray companion replaces an already-running terminal daemon so the trusted tray process becomes the
 approval provider.
+
+If an agent requests a secret while the daemon is locked, the tray now opens the vault passphrase
+prompt automatically and continues to the normal approval dialog after a successful unlock. A
+cancelled or incorrect unlock never releases a secret.
 
 Linux requires a desktop notification service, Zenity or KDialog, GTK 3, XDo, and AppIndicator.
 For Debian or Ubuntu:
@@ -214,6 +218,27 @@ unlocked. Normal audited requests reuse that key but encrypt every new vault gen
 nonce, avoiding another Argon2 run and disk reload per request. Manual lock, idle timeout (15 minutes
 by default), graceful stop, and process shutdown drop the session. The on-disk vault format remains
 version 1 and is backward compatible; no migration is required.
+
+## Per-secret auto-approval
+
+For low-risk secrets, opt a client into prompt-free access when creating the secret:
+
+```sh
+akc add --name local-api-key --value '...' --auto-approve-client codex
+```
+
+The terminal approval prompt accepts `y` for one request or `a` to remember the choice for the
+prompted client and secret(s). The tray offers **Approve once** and **Approve automatically**.
+The remembered policy is encrypted with the vault and remains scoped to the named secret and
+self-reported client label.
+
+To avoid repeated lock/unlock cycles on a trusted single-user machine, disable idle locking:
+
+```sh
+akc config idle-lock 0
+```
+
+The daemon will then retain the decrypted vault in memory until it is stopped or explicitly locked.
 
 ## Temporary auto-approve grants
 

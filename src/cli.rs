@@ -53,6 +53,9 @@ pub enum Command {
         /// Self-reported client labels; these are policy labels, not verified executable identities.
         #[arg(long = "allow-client")]
         allowed_clients: Vec<String>,
+        /// Client labels that may read this secret without an approval prompt.
+        #[arg(long = "auto-approve-client")]
+        auto_approve_clients: Vec<String>,
         #[arg(long)]
         notes: Option<String>,
         #[arg(long)]
@@ -167,7 +170,7 @@ pub enum ConfigCommand {
         #[command(subcommand)]
         command: AutoApproveCommand,
     },
-    /// Configure daemon idle auto-lock (30 seconds to 24 hours).
+    /// Configure daemon idle auto-lock (30 seconds to 24 hours; 0 disables it).
     IdleLock { seconds: u64 },
 }
 
@@ -221,6 +224,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             rotate_after,
             one_time,
             allowed_clients,
+            auto_approve_clients,
             notes,
             url,
         } => add_secret(
@@ -232,6 +236,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 rotate_after,
                 one_time,
                 allowed_clients,
+                auto_approve_clients,
                 notes,
                 url,
                 ..Default::default()
@@ -547,15 +552,22 @@ fn atty_stdin() -> bool {
     io::stdin().is_terminal()
 }
 
-pub fn prompt_approval(prompt: &str) -> Result<bool> {
-    print!("{prompt} [y/N]: ");
+pub enum ApprovalChoice {
+    Once,
+    Always,
+    Deny,
+}
+
+pub fn prompt_approval(prompt: &str) -> Result<ApprovalChoice> {
+    print!("{prompt} [y=once, a=always/N]: ");
     io::stdout().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    Ok(match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => ApprovalChoice::Once,
+        "a" | "always" => ApprovalChoice::Always,
+        _ => ApprovalChoice::Deny,
+    })
 }
 
 fn configure(command: ConfigCommand) -> Result<()> {
@@ -628,13 +640,19 @@ fn configure(command: ConfigCommand) -> Result<()> {
             }
         },
         ConfigCommand::IdleLock { seconds } => {
-            if !(30..=24 * 60 * 60).contains(&seconds) {
-                return Err(anyhow!("idle lock must be between 30 and 86400 seconds"));
+            if seconds != 0 && !(30..=24 * 60 * 60).contains(&seconds) {
+                return Err(anyhow!(
+                    "idle lock must be 0 or between 30 and 86400 seconds"
+                ));
             }
             store.set_idle_lock_seconds(seconds)?;
-            println!(
-                "daemon idle lock configured for {seconds} seconds; restart the daemon to apply"
-            );
+            if seconds == 0 {
+                println!(
+                    "daemon idle lock disabled; restart the daemon to apply (trusted machine only)"
+                );
+            } else {
+                println!("daemon idle lock configured for {seconds} seconds; restart the daemon to apply");
+            }
         }
     }
     Ok(())

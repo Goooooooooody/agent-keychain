@@ -29,6 +29,9 @@ enum UserEvent {
         prompt: ApprovalPrompt,
         response: mpsc::SyncSender<ApprovalDecision>,
     },
+    Unlock {
+        response: mpsc::SyncSender<Option<String>>,
+    },
     Menu(MenuEvent),
     Tray(TrayIconEvent),
     Status(Result<AgentResponse, String>),
@@ -48,6 +51,16 @@ impl ApprovalProvider for TrayApprovalProvider {
         receiver
             .recv_timeout(APPROVAL_TIMEOUT)
             .map_err(|_| anyhow!("approval timed out"))
+    }
+
+    fn unlock(&self) -> Result<Option<String>> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.proxy
+            .send_event(UserEvent::Unlock { response })
+            .map_err(|_| anyhow!("tray event loop is unavailable"))?;
+        receiver
+            .recv_timeout(APPROVAL_TIMEOUT)
+            .map_err(|_| anyhow!("unlock prompt timed out"))
     }
 }
 
@@ -313,6 +326,21 @@ impl ApplicationHandler<UserEvent> for Application {
                     let _ = proxy.send_event(UserEvent::Status(status));
                 });
             }
+            UserEvent::Unlock { response } => {
+                let proxy = self.proxy.clone();
+                thread::spawn(move || {
+                    let passphrase = tinyfiledialogs::password_box(
+                        "Unlock Agent Keychain",
+                        "An agent needs a key. Enter the vault passphrase to continue.",
+                    );
+                    let _ = response.send(passphrase);
+                    let _ = proxy.send_event(UserEvent::Status(
+                        socket_path()
+                            .and_then(daemon_status)
+                            .map_err(|error| format!("{error:#}")),
+                    ));
+                });
+            }
             UserEvent::Menu(event) => self.handle_menu(event_loop, event),
             UserEvent::Tray(_event) => {}
             UserEvent::Status(Ok(AgentResponse::DaemonStatus {
@@ -327,9 +355,10 @@ impl ApplicationHandler<UserEvent> for Application {
             }
             UserEvent::Status(Ok(_)) => show_error("Daemon returned an unexpected status response"),
             UserEvent::Status(Err(error)) => {
-                if self.daemon_running {
-                    show_error(&format!("Daemon status failed: {error}"));
-                }
+                // Status refreshes race daemon startup, stop, and approval dialogs. Do not
+                // turn a transient IPC failure into a generic native application popup; a
+                // genuine startup/runtime failure is reported by DaemonExited below.
+                let _ = error;
             }
             UserEvent::DaemonExited(result) => {
                 self.daemon_running = false;
@@ -429,7 +458,7 @@ fn show_approval(prompt: ApprovalPrompt) -> ApprovalDecision {
         format!("Secrets: {}", prompt.secret_names.join(", "))
     };
     let body = format!(
-        "Agent: {}\n{}\nReason: {}\nCommand: {}\nProcess: {}\n\nApprove this request once?",
+        "Agent: {}\n{}\nReason: {}\nCommand: {}\nProcess: {}\n\nApprove once, or remember this client for these secret(s)?",
         prompt.agent,
         secret_label,
         prompt.reason.as_deref().unwrap_or("Not provided"),
@@ -450,9 +479,10 @@ fn show_approval(prompt: ApprovalPrompt) -> ApprovalDecision {
         .set_title("Agent Keychain — approval required")
         .set_description(body)
         .set_level(MessageLevel::Warning)
-        .set_buttons(MessageButtons::OkCancelCustom(
-            "Deny".into(),
+        .set_buttons(MessageButtons::YesNoCancelCustom(
             "Approve once".into(),
+            "Approve automatically".into(),
+            "Deny".into(),
         ))
         .show();
     approval_decision_for_dialog(result)
@@ -462,6 +492,9 @@ fn approval_decision_for_dialog(result: MessageDialogResult) -> ApprovalDecision
     match result {
         MessageDialogResult::Custom(label) if label == "Approve once" => {
             ApprovalDecision::ApproveOnce
+        }
+        MessageDialogResult::Custom(label) if label == "Approve automatically" => {
+            ApprovalDecision::ApproveAlways
         }
         _ => ApprovalDecision::Deny,
     }

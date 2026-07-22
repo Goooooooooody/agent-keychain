@@ -6,7 +6,7 @@ description: >
 license: Apache-2.0
 metadata:
   author: goody
-  version: "1.2"
+  version: "1.3"
 ---
 
 ## When to Use
@@ -24,7 +24,13 @@ Use this skill when a task requires a secret that may be stored in Agent Keychai
 - When multiple secrets are known up front, request them together as one batch. Do not create avoidable sequential approval prompts.
 - ALWAYS include a concrete reason with the request.
 - Treat returned secrets as ephemeral: use once, do not store in files, logs, memory notes, commits, or summaries.
-- If the daemon denies access or is not running, tell the user exactly what failed and do not work around the approval flow.
+- If the daemon is locked, continue with the normal `agent-get` request: the desktop tray can prompt
+  the user to unlock the vault and then show the approval dialog. Do not ask the user to paste a
+  passphrase or try to unlock the vault through another path.
+- If the tray/provider is unavailable, the daemon cannot unlock interactively, or access is denied,
+  tell the user exactly what failed and stop; never work around the approval flow.
+- Some secrets may have an explicit per-secret auto-approval policy. This is still audited and scoped
+  to the requested client label and secret; do not assume it applies to other secrets or agents.
 
 ## Commands
 
@@ -47,6 +53,10 @@ akc agent-get --name <secret-one> <secret-two> [<secret-three> ...] --agent "${A
 ```
 
 Batch output uses `name=value`. Each item is audited and checked independently; treat every returned value as ephemeral.
+
+When using the desktop tray, a locked-vault request may produce two user prompts in sequence: unlock
+the vault, then approve the secret request. A cancelled or failed unlock must be reported as a
+failure; do not retry repeatedly.
 
 Using the installed shell hook:
 

@@ -112,11 +112,19 @@ impl ApprovalPrompt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalDecision {
     ApproveOnce,
+    /// Approve this client for the prompted secret(s) from now on.
+    ApproveAlways,
     Deny,
 }
 
 pub trait ApprovalProvider: Send + Sync {
     fn decide(&self, prompt: ApprovalPrompt) -> Result<ApprovalDecision>;
+
+    /// Ask the local user to unlock the vault before continuing an agent request.
+    /// Providers that cannot show a secure passphrase prompt leave this unavailable.
+    fn unlock(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 #[derive(Default)]
@@ -138,11 +146,15 @@ impl ApprovalProvider for TerminalApprovalProvider {
         if let Some(reason) = prompt.reason {
             message.push_str(&format!(" for: {reason}"));
         }
-        Ok(if prompt_approval(&message)? {
-            ApprovalDecision::ApproveOnce
-        } else {
-            ApprovalDecision::Deny
+        Ok(match prompt_approval(&message)? {
+            crate::cli::ApprovalChoice::Once => ApprovalDecision::ApproveOnce,
+            crate::cli::ApprovalChoice::Always => ApprovalDecision::ApproveAlways,
+            crate::cli::ApprovalChoice::Deny => ApprovalDecision::Deny,
         })
+    }
+
+    fn unlock(&self) -> Result<Option<String>> {
+        Ok(Some(prompt_passphrase()?))
     }
 }
 
@@ -759,7 +771,9 @@ fn send_request(socket_path: PathBuf, command: &AgentCommand) -> Result<AgentRes
     conn.get_mut().flush()?;
     if matches!(
         command,
-        AgentCommand::GetSecret(_) | AgentCommand::GetSecrets { .. }
+        AgentCommand::GetSecret(_)
+            | AgentCommand::GetSecrets { .. }
+            | AgentCommand::SearchSecrets { .. }
     ) {
         conn.get_mut().set_read_timeout(APPROVAL_RESPONSE_TIMEOUT)?;
     } else {
@@ -811,6 +825,43 @@ fn handle_client(stream: Stream, state: &Arc<Mutex<DaemonState>>) -> Result<()> 
             .map_err(|_| anyhow!("daemon state lock poisoned"))?;
         Arc::clone(&state.approval_provider)
     };
+    let unlock_result = if command_requires_unlock(&command)
+        && state
+            .lock()
+            .map_err(|_| anyhow!("daemon state lock poisoned"))?
+            .session
+            .is_none()
+    {
+        match approval_provider.unlock() {
+            Ok(Some(mut passphrase)) => {
+                let result = state
+                    .lock()
+                    .map_err(|_| anyhow!("daemon state lock poisoned"))
+                    .and_then(|mut state| {
+                        let session = state.store.unlock(&passphrase).map_err(|_| {
+                            anyhow!("vault unlock failed; check the passphrase and try again")
+                        })?;
+                        state.session = Some(session);
+                        state.last_secret_activity = Instant::now();
+                        Ok(())
+                    });
+                passphrase.zeroize();
+                result
+            }
+            Ok(None) => Ok(()),
+            Err(error) => Err(error.context("vault unlock prompt failed")),
+        }
+    } else {
+        Ok(())
+    };
+    if let Err(error) = unlock_result {
+        return write_error_response(
+            &mut conn,
+            &request_id,
+            ErrorCode::AuthenticationFailed,
+            error,
+        );
+    }
     let approval_prompt = {
         let mut state = state
             .lock()
@@ -859,6 +910,15 @@ fn handle_client(stream: Stream, state: &Arc<Mutex<DaemonState>>) -> Result<()> 
     Ok(())
 }
 
+fn command_requires_unlock(command: &AgentCommand) -> bool {
+    matches!(
+        command,
+        AgentCommand::GetSecret(_)
+            | AgentCommand::GetSecrets { .. }
+            | AgentCommand::SearchSecrets { .. }
+    )
+}
+
 fn is_timeout_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
@@ -903,7 +963,10 @@ fn approval_prompt_for_command(
             (!state
                 .grants
                 .iter()
-                .any(|grant| grant_matches(grant, &request)))
+                .any(|grant| grant_matches(grant, &request))
+                && !state.session.as_ref().is_some_and(|session| {
+                    session.auto_approved_for(&request.secret_name, &request.agent)
+                }))
             .then(|| ApprovalPrompt::single(&request))
         }
         AgentCommand::GetSecrets {
@@ -931,11 +994,23 @@ fn approval_prompt_for_command(
                 })
                 .collect::<Result<Vec<_>>>()
                 .ok()?;
-            (!batch_is_fully_granted(&state.grants, &requests))
+            (!batch_is_fully_auto_approved(state, &requests))
                 .then(|| ApprovalPrompt::batch(&requests))
         }
         _ => None,
     }
+}
+
+fn batch_is_fully_auto_approved(state: &DaemonState, requests: &[AgentRequest]) -> bool {
+    requests.iter().all(|request| {
+        state
+            .grants
+            .iter()
+            .any(|grant| grant_matches(grant, request))
+            || state.session.as_ref().is_some_and(|session| {
+                session.auto_approved_for(&request.secret_name, &request.agent)
+            })
+    })
 }
 
 fn handle_command(
@@ -1137,8 +1212,9 @@ fn handle_get_secrets(
         );
     }
     prune_grants(state);
-    let all_granted = batch_is_fully_granted(&state.grants, &requests);
-    let approved = if all_granted {
+    let all_auto_approved = batch_is_fully_auto_approved(state, &requests);
+    let remember = matches!(approval, Some(Ok(ApprovalDecision::ApproveAlways)));
+    let approved = if all_auto_approved {
         true
     } else {
         matches!(
@@ -1148,18 +1224,25 @@ fn handle_get_secrets(
                     .decide(ApprovalPrompt::batch(&requests))
                     .map_err(|error| error.to_string())
             }),
-            Ok(ApprovalDecision::ApproveOnce)
+            Ok(ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveAlways)
         )
     };
     state.last_secret_activity = Instant::now();
     let Some(session) = state.session.as_mut() else {
         return error_response(ErrorCode::Locked, "daemon is locked");
     };
-    let outcome =
-        session.transaction(|vault| fulfill_batch(vault, &requests, approved, all_granted));
+    let outcome = session.transaction(|vault| {
+        if remember && approved {
+            for request in &requests {
+                // Missing names still receive the normal per-item denial below.
+                let _ = vault.add_auto_approve_client(&request.secret_name, &request.agent);
+            }
+        }
+        fulfill_batch(vault, &requests, approved, all_auto_approved)
+    });
     match outcome {
         Ok(results) => {
-            if all_granted {
+            if all_auto_approved {
                 // A capability use is committed only after the approved value was durably
                 // audited and is ready to be returned. Denied/missing items do not consume it.
                 for (request, result) in requests.iter().zip(&results) {
@@ -1177,6 +1260,7 @@ fn handle_get_secrets(
     }
 }
 
+#[cfg(test)]
 fn batch_is_fully_granted(grants: &[ScopedGrant], requests: &[AgentRequest]) -> bool {
     let mut available_uses: Vec<u32> = grants.iter().map(|grant| grant.remaining_uses).collect();
     requests.iter().all(|request| {
@@ -1249,7 +1333,10 @@ fn fulfill_batch(
 
 fn expire_idle_session(state: &mut DaemonState) {
     prune_grants(state);
-    if state.session.is_some() && state.last_secret_activity.elapsed() >= state.idle_timeout {
+    if state.session.is_some()
+        && !state.idle_timeout.is_zero()
+        && state.last_secret_activity.elapsed() >= state.idle_timeout
+    {
         state.session = None;
         state.grants.clear();
     }
@@ -1270,12 +1357,13 @@ fn handle_get_secret(
     let auto_approved = state
         .grants
         .iter()
-        .any(|grant| grant_matches(grant, &request));
+        .any(|grant| grant_matches(grant, &request))
+        || state
+            .session
+            .as_ref()
+            .is_some_and(|session| session.auto_approved_for(&request.secret_name, &request.agent));
+    let remember = matches!(approval, Some(Ok(ApprovalDecision::ApproveAlways)));
     let approved = if auto_approved {
-        println!(
-            "used scoped grant for agent '{}' and secret '{}'",
-            request.agent, request.secret_name
-        );
         true
     } else {
         match approval.unwrap_or_else(|| {
@@ -1284,13 +1372,13 @@ fn handle_get_secret(
                 .decide(ApprovalPrompt::single(&request))
                 .map_err(|error| error.to_string())
         }) {
-            Ok(ApprovalDecision::ApproveOnce) => true,
+            Ok(ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveAlways) => true,
             Ok(ApprovalDecision::Deny) => false,
             Err(error) => return audit_request_error(state, &request, error),
         }
     };
     state.last_secret_activity = Instant::now();
-    let response = complete_get_secret(state, request.clone(), approved, auto_approved);
+    let response = complete_get_secret(state, request.clone(), approved, auto_approved, remember);
     if auto_approved && matches!(response, AgentResponse::Approved { .. }) {
         consume_matching_grant(state, &request);
     }
@@ -1451,6 +1539,7 @@ fn complete_get_secret(
     request: AgentRequest,
     approved: bool,
     auto_approved: bool,
+    remember: bool,
 ) -> AgentResponse {
     enum Outcome {
         Approved(String),
@@ -1479,6 +1568,11 @@ fn complete_get_secret(
             request.pid,
         );
         if approved {
+            if remember {
+                // A missing name should remain a normal denied/error result, not turn the
+                // whole request into a persistence failure.
+                let _ = vault.add_auto_approve_client(&request.secret_name, &request.agent);
+            }
             match vault.get_secret_for_peer(
                 &request.secret_name,
                 &request.agent,

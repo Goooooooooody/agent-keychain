@@ -14,6 +14,7 @@ pub struct Config {
     #[serde(default)]
     pub auto_approve_agent_requests: bool,
     /// Drop the daemon's decrypted vault and derived key after this much secret-access inactivity.
+    /// Zero disables idle locking; use only on a trusted, single-user machine.
     #[serde(default = "default_idle_lock_seconds")]
     pub idle_lock_seconds: u64,
 }
